@@ -1,6 +1,6 @@
-# DoubaoChatAPI
+# doubao2api
 
-逆向工程豆包（Doubao）聊天 API，提供完整可用的 Python 异步客户端和 OpenAI 兼容 REST 服务。
+逆向工程豆包（Doubao）API，提供完整可用的 Python 异步客户端和 OpenAI 兼容 REST 服务。支持多轮对话（含深度思考/联网搜索）、图片生成、视频生成、音乐生成、文件上传，以及 QR 扫码登录和自动验证码处理。
 
 ## 原理
 
