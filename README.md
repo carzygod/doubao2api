@@ -1302,13 +1302,24 @@ curl http://localhost:9090/v1/chat/completions \
 先通过 `/v1/files` 上传，然后在多次对话中复用同一个文件 URI：
 
 ```bash
-# Step 1: 上传文件
-FILE_URI=$(curl -s http://localhost:9090/v1/files \
-  -F "file=@report.pdf" | python -c "import sys,json; print(json.load(sys.stdin)['uri'])")
+# Step 1: 上传文件（只需一次）
+curl -s http://localhost:9090/v1/files -F "file=@report.pdf"
+# -> {"uri": "tos-cn-i-ik7evvg4ik/xxx.pdf", "filename": "report.pdf", "bytes": 102400, ...}
 
-# Step 2: 在对话中引用（通过 data URI 包装 URI 字符串）
-# 注意：当前版本中 file_url 需要传递实际文件内容（base64 或 URL），
-# 不支持直接传递 TOS URI。如需复用已上传文件，请使用 Python SDK。
+# Step 2: 在对话中直接引用 TOS URI（可多次复用，不会重复上传）
+curl http://localhost:9090/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "doubao-expert",
+    "messages": [{"role": "user", "content": [
+      {"type": "file_url", "file_url": {
+        "url": "tos-cn-i-ik7evvg4ik/xxx.pdf",
+        "name": "report.pdf",
+        "size": 102400
+      }},
+      {"type": "text", "text": "总结这份报告的要点"}
+    ]}]
+  }'
 ```
 
 **`file_url` 内容类型参数**：
@@ -1317,14 +1328,18 @@ FILE_URI=$(curl -s http://localhost:9090/v1/files \
 {
   "type": "file_url",
   "file_url": {
-    "url": "data:application/pdf;base64,..." 
+    "url": "data:application/pdf;base64,...",
+    "name": "report.pdf",
+    "size": 102400
   }
 }
 ```
 
-| 字段 | 说明 |
-|------|------|
-| `url` | 文件来源。支持两种格式：<br>• `data:{mime};base64,{base64_data}` — 直接传递文件内容<br>• `https://example.com/file.pdf` — HTTP(S) URL，服务器会下载 |
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `url` | string | 是 | 文件来源，支持三种格式：<br>• `tos-cn-i-xxx/yyy.pdf` — 已上传的 TOS URI（不会重复上传）<br>• `data:{mime};base64,{data}` — 直接传递文件内容<br>• `https://example.com/file.pdf` — HTTP(S) URL，服务器会下载 |
+| `name` | string | 否 | 文件名（使用 TOS URI 时建议提供） |
+| `size` | int | 否 | 文件大小字节数（使用 TOS URI 时建议提供） |
 
 **支持混合多种内容类型**：
 
