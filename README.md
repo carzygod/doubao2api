@@ -117,6 +117,21 @@ async with DoubaoChatClient.from_session(bot_id=EXTENSION_BOT_ID) as client:
 
 > **注意**: 图片功能需要使用 `EXTENSION_BOT_ID`（`7338286299411103781`）。
 
+**通过 REST API 上传大图片（推荐，无需 base64）**：
+```bash
+# 先上传图片，获取 CDN URL
+curl -F "file=@photo.jpg" http://localhost:9090/v1/images/upload
+# -> {"url": "https://...", "key": "tos-cn-i-.../xxx.png", ...}
+
+# 然后在聊天中直接引用 URL
+curl http://localhost:9090/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"doubao-expert","messages":[{"role":"user","content":[
+    {"type":"text","text":"这是什么？"},
+    {"type":"image_url","image_url":{"url":"上一步返回的url"}}
+  ]}],"stream":true}'
+```
+
 ### 文件上传 + 文档对话
 
 支持 PDF、TXT、DOCX、XLSX、PPTX、CSV、Markdown、代码文件等 60+ 种格式。
@@ -1182,6 +1197,65 @@ curl http://localhost:9090/v1/files \
 | 401 | 认证失败 |
 | 429 | 速率限制 |
 | 502 | 上传失败（TOS 存储异常） |
+
+---
+
+#### POST /v1/images/upload
+
+图片上传端点。上传图片后返回 CDN URL，可直接用于 `/v1/chat/completions` 的 `image_url` 内容类型，**无需 base64 编码**。
+
+适用场景：本地大图片、避免 base64 膨胀（+33% 体积）。
+
+**请求格式**：`multipart/form-data`
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `file` | file | 是 | 图片文件（png/jpg/webp） |
+
+**curl 示例**：
+```bash
+# 上传图片
+curl http://localhost:9090/v1/images/upload \
+  -F "file=@photo.jpg"
+```
+
+**响应**：
+```json
+{
+  "url": "https://p-vcloud.byteimg.com/tos-cn-i-ik7evvg4ik/xxx.png~tplv-...",
+  "key": "tos-cn-i-ik7evvg4ik/xxx.png",
+  "filename": "photo.jpg",
+  "bytes": 2048576
+}
+```
+
+| 响应字段 | 类型 | 说明 |
+|----------|------|------|
+| `url` | string | CDN URL，直接用于 `image_url.url` |
+| `key` | string | TOS 存储路径 |
+| `filename` | string | 原始文件名 |
+| `bytes` | int | 文件大小（字节） |
+
+**完整使用流程**：
+```bash
+# 1. 上传图片
+URL=$(curl -s http://localhost:9090/v1/images/upload \
+  -F "file=@photo.jpg" | jq -r '.url')
+
+# 2. 在聊天中引用（无需 base64）
+curl http://localhost:9090/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"doubao-expert\",
+    \"messages\": [{\"role\": \"user\", \"content\": [
+      {\"type\": \"text\", \"text\": \"描述这张图片\"},
+      {\"type\": \"image_url\", \"image_url\": {\"url\": \"$URL\"}}
+    ]}],
+    \"stream\": true
+  }"
+```
+
+> 已上传的图片 URL（含 `tos-cn-i-`）会被自动识别，不会重复上传。
 
 ---
 
