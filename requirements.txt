@@ -1,0 +1,9 @@
+# Core (cross-platform)
+aiohttp
+fastapi
+pydantic
+uvicorn
+
+# Windows only (cookie decryption from Chromium, optional)
+# pywin32
+# cryptography

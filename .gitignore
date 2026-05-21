@@ -1,0 +1,27 @@
+# Sensitive session data
+.doubao_session.json
+decrypted_cookies.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# IDE / Editor
+.cursor/
+.vscode/
+.idea/
+
+# Generated artifacts
+doubao_qr_login.png
+server_out.txt
+server_err.txt
+
+# OS
+Thumbs.db
+.DS_Store
