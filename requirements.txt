@@ -1,9 +1,5 @@
-# Core (cross-platform)
-aiohttp
-fastapi
-pydantic
-uvicorn
-
-# Windows only (cookie decryption from Chromium, optional)
-# pywin32
-# cryptography
+# Core dependencies
+aiohttp>=3.9
+fastapi>=0.100
+pydantic>=2.0
+uvicorn>=0.20

@@ -2,6 +2,7 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-green.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Docker](https://img.shields.io/badge/docker-supported-blue?logo=docker)](https://github.com/wangchuxiaoji-oss/doubao2api#docker-%E9%83%A8%E7%BD%B2%E5%8F%AF%E9%80%89)
 [![GitHub Stars](https://img.shields.io/github/stars/wangchuxiaoji-oss/doubao2api?style=social)](https://github.com/wangchuxiaoji-oss/doubao2api/stargazers)
 [![GitHub Forks](https://img.shields.io/github/forks/wangchuxiaoji-oss/doubao2api?style=social)](https://github.com/wangchuxiaoji-oss/doubao2api/network/members)
 [![GitHub Issues](https://img.shields.io/github/issues/wangchuxiaoji-oss/doubao2api)](https://github.com/wangchuxiaoji-oss/doubao2api/issues)
@@ -23,10 +24,29 @@
 
 ## 快速开始
 
+### 安装
+
+```bash
+# 方式一：pip 安装（推荐）
+pip install git+https://github.com/wangchuxiaoji-oss/doubao2api.git
+
+# 方式二：从源码
+git clone https://github.com/wangchuxiaoji-oss/doubao2api.git
+cd doubao2api
+pip install -e .
+```
+
+### Docker 部署（可选）
+
+```bash
+docker build -t doubao2api .
+docker run -d -p 9090:9090 -v ./. doubao_session.json:/app/.doubao_session.json doubao2api
+```
+
 ### 前置条件
 
 1. Python 3.10+
-2. `pip install -r requirements.txt`
+2. 已安装依赖（pip install 会自动处理）
 
 ### QR 扫码登录（推荐，跨平台）
 

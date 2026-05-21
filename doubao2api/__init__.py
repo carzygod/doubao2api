@@ -1,3 +1,5 @@
+__version__ = "0.1.0"
+
 from .client import (
     ChatMessage,
     ChatResult,
@@ -41,4 +43,5 @@ __all__ = [
     "load_cookies",
     "load_session",
     "save_params",
+    "__version__",
 ]

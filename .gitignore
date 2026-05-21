@@ -1,6 +1,7 @@
 # Sensitive session data
 .doubao_session.json
 decrypted_cookies.json
+.env
 
 # Python
 __pycache__/
