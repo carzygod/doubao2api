@@ -1862,3 +1862,7 @@ doubao2api/
 └── static/
     └── admin.html       # Admin Dashboard（Vue 3）
 ```
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=wangchuxiaoji-oss/doubao2api&type=Date)](https://star-history.com/#wangchuxiaoji-oss/doubao2api&Date)
