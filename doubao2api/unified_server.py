@@ -38,11 +38,6 @@ from .client import (
     DoubaoChatClient,
     DoubaoChatError,
     DoubaoRateLimitError,
-    GeneratedImage,
-    GeneratedMusic,
-    GeneratedVideo,
-    ImageGenerationResult,
-    MusicGenerationResult,
     UploadedFile,
     VideoGenerationResult,
 )
@@ -325,7 +320,7 @@ def create_app(
         print("=" * 60)
         print("  [!] 未检测到有效的 session")
         print()
-        print(f"  请访问 Dashboard 扫码登录:")
+        print("  请访问 Dashboard 扫码登录:")
         print(f"  http://{host}:{port}/admin?key=<YOUR_API_KEY>")
         print()
         print("  或通过 API 手动更新 Cookie:")
@@ -1544,7 +1539,7 @@ def create_app(
         await bucket.acquire()
 
         try:
-            client = await _get_client()
+            await _get_client()
         except HTTPException:
             raise
         except Exception as exc:
@@ -1706,14 +1701,14 @@ def run_server() -> None:
     print(f"  API key    : {auth_status}")
     print()
     print("Endpoints:")
-    print(f"  GET  /v1/models")
-    print(f"  POST /v1/files")
-    print(f"  POST /v1/chat/completions")
-    print(f"  POST /v1/images/generations")
-    print(f"  POST /v1/videos/generations")
-    print(f"  GET  /v1/videos/{{task_id}}")
-    print(f"  POST /v1/audio/generations")
-    print(f"  GET  /admin                  (Dashboard)")
+    print("  GET  /v1/models")
+    print("  POST /v1/files")
+    print("  POST /v1/chat/completions")
+    print("  POST /v1/images/generations")
+    print("  POST /v1/videos/generations")
+    print("  GET  /v1/videos/{task_id}")
+    print("  POST /v1/audio/generations")
+    print("  GET  /admin                  (Dashboard)")
     print()
     print("Chat models:", ", ".join(CHAT_MODELS))
     print("Image model:", ", ".join(IMAGE_MODELS))

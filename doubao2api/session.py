@@ -7,9 +7,8 @@ Supports loading cookies from:
 """
 import json
 import os
-import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 
 def _parse_cookie_header(cookie_header: str) -> Dict[str, str]:

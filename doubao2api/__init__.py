@@ -1,6 +1,9 @@
 __version__ = "0.1.0"
 
+from .captcha_handler import AutoCaptchaHandler, CaptchaHandler
 from .client import (
+    DEFAULT_BOT_ID,
+    EXTENSION_BOT_ID,
     ChatMessage,
     ChatResult,
     CompletionChunk,
@@ -15,10 +18,7 @@ from .client import (
     MusicGenerationResult,
     UploadedFile,
     VideoGenerationResult,
-    DEFAULT_BOT_ID,
-    EXTENSION_BOT_ID,
 )
-from .captcha_handler import AutoCaptchaHandler, CaptchaHandler
 from .session import load_cookies, load_session, save_params
 
 __all__ = [

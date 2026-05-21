@@ -11,13 +11,12 @@ import hashlib
 import hmac as hmac_mod
 import json
 import logging
-import os
 import uuid
 import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Union
-from urllib.parse import urlencode, quote, urlparse, parse_qs
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 import aiohttp
 
@@ -1643,7 +1642,7 @@ class DoubaoChatClient:
             full_text = "".join(text_parts)
             if "服务过载" in full_text or "重试" in full_text:
                 raise DoubaoChatError(
-                    f"generate_video: 服务过载，请稍后重试"
+                    "generate_video: 服务过载，请稍后重试"
                 )
             # Try parsing as sync response (content_type=2021)
             return self._parse_video_sse(raw, prompt)
