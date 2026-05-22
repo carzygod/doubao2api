@@ -376,8 +376,24 @@ def create_app(
         client = _browser.get("client")
         if client is None:
             return {"logged_in": False, "browser": "not_started"}
+
+        # Do a live check of the page state
+        page_url = client.page.url if client.page else ""
+        login_btn_count = 0
+        if client.page:
+            try:
+                login_btn = client.page.locator('button:has-text("登录")')
+                login_btn_count = await login_btn.count()
+            except Exception:
+                pass
+
+        actual_logged_in = client.is_ready and login_btn_count == 0
+
         return {
-            "logged_in": client.is_ready,
+            "logged_in": actual_logged_in,
+            "is_ready_flag": client.is_ready,
+            "login_button_visible": login_btn_count > 0,
+            "page_url": page_url,
             "device_id": client._device_id or "",
             "web_id": client._web_id or "",
         }
