@@ -36,6 +36,7 @@ from .tool_calling import (
     is_tool_call_start,
     has_complete_tool_calls,
 )
+from .token_counter import count_tokens, count_messages_tokens, SAFETY_FACTOR
 
 log = logging.getLogger("doubao_unified")
 
@@ -491,7 +492,8 @@ def create_app(
             return StreamingResponse(
                 _stream_chat(client, prompt, use_deep_think, request_id, model_name,
                              conversation_id=body.conversation_id, bot_id=body.bot_id,
-                             has_tools=has_tools),
+                             has_tools=has_tools,
+                             messages_for_counting=body.messages),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -540,6 +542,22 @@ def create_app(
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
 
+        # max_tokens truncation (non-streaming only)
+        content = message.get("content") or ""
+        if body.max_tokens and content and not message.get("tool_calls"):
+            max_chars = int(body.max_tokens * 2.5)  # rough tokens->chars
+            if len(content) > max_chars:
+                message["content"] = content[:max_chars]
+                finish_reason = "length"
+
+        # Token counting
+        prompt_tokens = count_messages_tokens(
+            [m.model_dump(exclude_none=True) for m in body.messages]
+        )
+        completion_content = message.get("content") or ""
+        reasoning_content = message.get("reasoning_content") or ""
+        completion_tokens = count_tokens(completion_content + reasoning_content)
+
         resp_data = {
             "id": request_id,
             "object": "chat.completion",
@@ -550,7 +568,11 @@ def create_app(
                 "message": message,
                 "finish_reason": finish_reason,
             }],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
         }
         if message.get("conversation_id"):
             resp_data["conversation_id"] = message["conversation_id"]
@@ -887,6 +909,7 @@ def create_app(
         conversation_id: Optional[str] = None,
         bot_id: Optional[str] = None,
         has_tools: bool = False,
+        messages_for_counting: Optional[list] = None,
     ):
         """Generate real-time SSE stream in OpenAI format via httpx streaming.
 
@@ -900,6 +923,7 @@ def create_app(
         thinking_count = 0
         in_thinking = False
         had_reasoning_content = False  # Track if any reasoning was emitted
+        stream_content_chars = 0  # Track total output chars for token estimation
         # Track last emitted result count per block_id for incremental updates
         search_last_count: dict = {}
         result_conversation_id: Optional[str] = None
@@ -1044,6 +1068,7 @@ def create_app(
                         had_reasoning_content = True
                     else:
                         delta = {"role": "assistant", "content": t}
+                    stream_content_chars += len(t)
                     chunk = _make_chunk(delta)
                     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                     continue
@@ -1136,6 +1161,7 @@ def create_app(
                                 had_reasoning_content = True
                             else:
                                 delta = {"role": "assistant", "content": t}
+                            stream_content_chars += len(t)
                             chunk = _make_chunk(delta)
                             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                         continue
@@ -1195,15 +1221,30 @@ def create_app(
                 chunk = _make_chunk(delta)
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
-        # Final chunk
+        # Final chunk with usage
         client.record_success()
         # Report to expert tracker for degradation detection
         if has_tools and use_deep_think >= 1:
             _expert_tracker.report_response(had_reasoning_content)
+
+        # Estimate token usage
+        prompt_tokens = 0
+        if messages_for_counting:
+            prompt_tokens = count_messages_tokens(
+                [m.model_dump(exclude_none=True) for m in messages_for_counting]
+            )
+        completion_tokens = int(stream_content_chars / 2.5 * SAFETY_FACTOR) if stream_content_chars else 0
+
         final_delta: dict = {}
         if result_conversation_id:
             final_delta["conversation_id"] = result_conversation_id
-        yield f"data: {json.dumps(_make_chunk(final_delta, 'tool_calls' if emitted_tool_calls else 'stop'))}\n\n"
+        final_chunk = _make_chunk(final_delta, 'tool_calls' if emitted_tool_calls else 'stop')
+        final_chunk["usage"] = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
 
     # ── Admin Dashboard & Auth ──
