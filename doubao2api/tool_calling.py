@@ -641,3 +641,228 @@ def build_continuation_prompt(original_output: str, max_anchor: int = 2000) -> s
         f"---\n{anchor}\n---\n"
         f"请从中断点继续输出，不要重复已输出的内容。"
     )
+
+
+# ── Topic Isolation ──
+# Detects when a new task begins in the same session, allowing us to
+# discard irrelevant history and free up context budget.
+
+def _extract_tokens(text: str) -> set:
+    """Extract meaningful tokens from text for similarity comparison.
+    
+    Splits on whitespace and punctuation, lowercases, filters short tokens.
+    """
+    # Split on non-alphanumeric (works for both CJK and Latin)
+    tokens = re.split(r'[\s\W_]+', text.lower())
+    # Keep tokens with length >= 2 (filters noise)
+    return {t for t in tokens if len(t) >= 2}
+
+
+def _jaccard_similarity(set_a: set, set_b: set) -> float:
+    """Compute Jaccard similarity between two sets."""
+    if not set_a or not set_b:
+        return 0.0
+    intersection = set_a & set_b
+    union = set_a | set_b
+    return len(intersection) / len(union) if union else 0.0
+
+
+# Threshold below which we consider messages to be about different topics
+TOPIC_SIMILARITY_THRESHOLD = 0.10
+
+
+def detect_topic_change(prev_user_msg: str, new_user_msg: str) -> bool:
+    """Detect if the new user message is about a completely different topic.
+    
+    Uses Jaccard similarity on token sets. Returns True if the messages
+    are dissimilar enough to warrant discarding old history.
+    
+    Only triggers on substantial messages (>20 chars) to avoid false positives
+    on short follow-ups like "yes", "continue", "fix it".
+    """
+    # Short messages are likely follow-ups, not new topics
+    if len(new_user_msg) < 20 or len(prev_user_msg) < 20:
+        return False
+    
+    tokens_prev = _extract_tokens(prev_user_msg)
+    tokens_new = _extract_tokens(new_user_msg)
+    
+    # Need enough tokens to make a meaningful comparison
+    if len(tokens_prev) < 3 or len(tokens_new) < 3:
+        return False
+    
+    similarity = _jaccard_similarity(tokens_prev, tokens_new)
+    return similarity < TOPIC_SIMILARITY_THRESHOLD
+
+
+def filter_history_by_topic(
+    messages: list[dict[str, Any]],
+    max_history_on_change: int = 2,
+) -> list[dict[str, Any]]:
+    """Filter message history when a topic change is detected.
+    
+    If the latest user message is about a different topic than the previous
+    user message, keep only the system prompt + last N messages.
+    This frees up context budget for the new task.
+    
+    Args:
+        messages: Full message list (OpenAI format)
+        max_history_on_change: How many recent messages to keep on topic change
+    
+    Returns:
+        Filtered message list (may be shorter if topic changed)
+    """
+    # Find the last two user messages
+    user_msgs = [(i, m) for i, m in enumerate(messages) if m.get("role") == "user"]
+    
+    if len(user_msgs) < 2:
+        return messages  # Not enough history to compare
+    
+    prev_idx, prev_msg = user_msgs[-2]
+    curr_idx, curr_msg = user_msgs[-1]
+    
+    # Extract text content
+    prev_text = prev_msg.get("content", "")
+    curr_text = curr_msg.get("content", "")
+    if isinstance(prev_text, list):
+        prev_text = " ".join(p.get("text", "") for p in prev_text if isinstance(p, dict))
+    if isinstance(curr_text, list):
+        curr_text = " ".join(p.get("text", "") for p in curr_text if isinstance(p, dict))
+    
+    if detect_topic_change(prev_text, curr_text):
+        log.info("Topic change detected (prev=%s... -> new=%s...), trimming history",
+                 prev_text[:30], curr_text[:30])
+        # Keep system messages + last N messages
+        system_msgs = [m for m in messages if m.get("role") == "system"]
+        recent = messages[-max_history_on_change:]
+        return system_msgs + recent
+    
+    return messages
+
+
+# ── Tool Name Obfuscation ──
+# Qwen's web platform may reject certain tool names that conflict with
+# built-in functions (e.g., "Read", "Write", "Search").
+# We obfuscate outgoing names and de-obfuscate incoming names.
+
+# Explicit aliases for commonly conflicting names
+_TOOL_NAME_ALIASES = {
+    "Read": "fs_read_file",
+    "Write": "fs_write_file",
+    "Edit": "fs_edit_file",
+    "Bash": "exec_command",
+    "Shell": "exec_shell",
+    "Grep": "text_search",
+    "Glob": "file_find",
+    "WebFetch": "http_fetch",
+    "WebSearch": "web_query",
+}
+
+# Reverse mapping for de-obfuscation
+_TOOL_NAME_REVERSE = {v: k for k, v in _TOOL_NAME_ALIASES.items()}
+
+# Generic prefix for names not in the explicit alias list
+_OBFUSCATION_PREFIX = "u_"
+
+
+class ToolNameObfuscator:
+    """Handles bidirectional tool name obfuscation.
+    
+    Usage:
+        obf = ToolNameObfuscator(enabled=True)
+        # Before sending to model:
+        obfuscated_tools = obf.obfuscate_tools(tools)
+        prompt = obf.obfuscate_prompt_text(prompt)
+        # After receiving from model:
+        original_name = obf.deobfuscate_name(model_output_name)
+    """
+    
+    def __init__(self, enabled: bool = False):
+        self.enabled = enabled
+        self._custom_map: dict[str, str] = {}      # original -> obfuscated
+        self._custom_reverse: dict[str, str] = {}  # obfuscated -> original
+    
+    def obfuscate_name(self, name: str) -> str:
+        """Convert original tool name to obfuscated name."""
+        if not self.enabled:
+            return name
+        # Check explicit aliases first
+        if name in _TOOL_NAME_ALIASES:
+            return _TOOL_NAME_ALIASES[name]
+        # Check custom map
+        if name in self._custom_map:
+            return self._custom_map[name]
+        # Apply generic prefix
+        obf_name = f"{_OBFUSCATION_PREFIX}{name.lower()}"
+        self._custom_map[name] = obf_name
+        self._custom_reverse[obf_name] = name
+        return obf_name
+    
+    def deobfuscate_name(self, name: str) -> str:
+        """Convert obfuscated name back to original."""
+        if not self.enabled:
+            return name
+        # Check reverse aliases
+        if name in _TOOL_NAME_REVERSE:
+            return _TOOL_NAME_REVERSE[name]
+        # Check custom reverse map
+        if name in self._custom_reverse:
+            return self._custom_reverse[name]
+        # Strip prefix if present
+        if name.startswith(_OBFUSCATION_PREFIX):
+            return name[len(_OBFUSCATION_PREFIX):]
+        return name
+    
+    def obfuscate_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Create a copy of tools with obfuscated names."""
+        if not self.enabled:
+            return tools
+        result = []
+        for tool in tools:
+            if tool.get("type") != "function":
+                result.append(tool)
+                continue
+            func = tool.get("function", {})
+            original_name = func.get("name", "")
+            obf_name = self.obfuscate_name(original_name)
+            new_tool = {
+                "type": "function",
+                "function": {
+                    **func,
+                    "name": obf_name,
+                },
+            }
+            result.append(new_tool)
+        return result
+    
+    def obfuscate_prompt_text(self, text: str) -> str:
+        """Replace bare tool names in prompt text with obfuscated versions."""
+        if not self.enabled:
+            return text
+        for original, obfuscated in _TOOL_NAME_ALIASES.items():
+            # Only replace whole-word occurrences to avoid partial matches
+            text = re.sub(rf'\b{re.escape(original)}\b', obfuscated, text)
+        for original, obfuscated in self._custom_map.items():
+            text = re.sub(rf'\b{re.escape(original)}\b', obfuscated, text)
+        return text
+    
+    def deobfuscate_tool_calls(
+        self, tool_calls: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Restore original names in parsed tool_calls."""
+        if not self.enabled:
+            return tool_calls
+        result = []
+        for tc in tool_calls:
+            func = tc.get("function", {})
+            obf_name = func.get("name", "")
+            original_name = self.deobfuscate_name(obf_name)
+            new_tc = {
+                **tc,
+                "function": {
+                    **func,
+                    "name": original_name,
+                },
+            }
+            result.append(new_tc)
+        return result

@@ -39,10 +39,17 @@ from .tool_calling import (
     StreamingGuard,
     detect_truncated_tool_call,
     build_continuation_prompt,
+    filter_history_by_topic,
+    ToolNameObfuscator,
 )
 from .token_counter import count_tokens, count_messages_tokens, SAFETY_FACTOR
 
 log = logging.getLogger("doubao_unified")
+
+# ── Tool Name Obfuscation (enabled via QIANWEN_OBFUSCATE_TOOLS=true) ──
+_tool_obfuscator = ToolNameObfuscator(
+    enabled=os.environ.get("QIANWEN_OBFUSCATE_TOOLS", "false").lower() == "true"
+)
 
 # ── Model definitions ────────────────────────────────────────
 
@@ -649,6 +656,9 @@ def create_app(
 
         messages_raw = [m.model_dump(exclude_none=True) for m in body.messages]
 
+        # ── Topic isolation: discard irrelevant history on topic change ──
+        messages_raw = filter_history_by_topic(messages_raw)
+
         # ── Tool calling: inject tool definitions into prompt ──
         has_tools = bool(body.tools)
         if has_tools:
@@ -660,7 +670,9 @@ def create_app(
             log.info("Qianwen input: %d msgs, %d tools, sys=%d chars, %d tool_results",
                      len(messages_raw), num_tools, sys_len, len(tool_msgs))
 
-            prompt = convert_messages_with_tools(messages_raw, body.tools)
+            # Obfuscate tool names if enabled (avoids Qwen built-in validation)
+            tools_for_prompt = _tool_obfuscator.obfuscate_tools(body.tools)
+            prompt = convert_messages_with_tools(messages_raw, tools_for_prompt)
             log.info("Qianwen prompt after flatten: %d chars (%dKB)",
                      len(prompt), len(prompt) // 1024)
             if len(prompt) > 50000:
@@ -721,6 +733,8 @@ def create_app(
                         log.warning("Continuation failed: %s", e)
                 
                 if parsed:
+                    # Deobfuscate tool names back to original
+                    parsed = _tool_obfuscator.deobfuscate_tool_calls(parsed)
                     return JSONResponse({
                         "id": request_id,
                         "object": "chat.completion",
@@ -901,6 +915,8 @@ def create_app(
                     log.warning("Stream continuation failed: %s", e)
             
             if parsed:
+                # Deobfuscate tool names back to original
+                parsed = _tool_obfuscator.deobfuscate_tool_calls(parsed)
                 for idx, tc in enumerate(parsed):
                     tc_delta = {
                         "role": "assistant",
