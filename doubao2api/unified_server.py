@@ -639,11 +639,20 @@ def create_app(
 
         messages_raw = [m.model_dump(exclude_none=True) for m in body.messages]
 
+        # ── Tool calling: inject tool definitions into prompt ──
+        has_tools = bool(body.tools)
+        if has_tools:
+            prompt = convert_messages_with_tools(messages_raw, body.tools)
+            # Wrap as single user message for Qianwen
+            messages_for_qw = [{"role": "user", "content": prompt}]
+        else:
+            messages_for_qw = messages_raw
+
         if body.stream:
             return StreamingResponse(
                 _stream_qianwen_chat(
-                    qw_client, messages_raw, qw_model, deep_search,
-                    request_id, body.model,
+                    qw_client, messages_for_qw, qw_model, deep_search,
+                    request_id, body.model, has_tools=has_tools,
                 ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -651,12 +660,38 @@ def create_app(
         else:
             # Non-streaming
             try:
-                result = await qw_client.chat(messages_raw, qw_model, deep_search)
+                result = await qw_client.chat(messages_for_qw, qw_model, deep_search)
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
 
             content = result["content"]
             usage = result.get("usage", {})
+
+            # Check for tool calls in response
+            if has_tools and is_tool_call_start(content.strip()):
+                parsed = parse_tool_calls_xml(content)
+                if parsed:
+                    return JSONResponse({
+                        "id": request_id,
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": result.get("model", body.model),
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": parsed,
+                            },
+                            "finish_reason": "tool_calls",
+                        }],
+                        "usage": {
+                            "prompt_tokens": usage.get("prompt_tokens", 0),
+                            "completion_tokens": usage.get("completion_tokens", 0),
+                            "total_tokens": usage.get("total_tokens", 0),
+                        },
+                    })
+
             return JSONResponse({
                 "id": request_id,
                 "object": "chat.completion",
@@ -681,9 +716,19 @@ def create_app(
         deep_search: str,
         request_id: str,
         model_name: str,
+        *,
+        has_tools: bool = False,
     ):
-        """Generate OpenAI-compatible SSE stream from Qianwen's cumulative format."""
+        """Generate OpenAI-compatible SSE stream from Qianwen's cumulative format.
+
+        Tool calling logic:
+        - Qianwen content is cumulative, so we check the full content for <tool_calls>
+        - Once detected, stop emitting content deltas and buffer until complete
+        - On completion, parse XML and emit as tool_calls chunks
+        """
         prev_content = ""  # Track previous content for delta calculation
+        tool_mode = False  # True once <tool_calls> detected in cumulative content
+        tool_content_start = 0  # Position where tool_calls XML starts
 
         def _make_chunk(delta: dict, finish_reason=None):
             return {
@@ -702,6 +747,8 @@ def create_app(
         chunk = _make_chunk({"role": "assistant", "content": ""})
         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
+        full_content = ""  # Cumulative content for tool detection
+
         try:
             async for event in qw_client.chat_stream(messages, model, deep_search):
                 if event.get("error"):
@@ -716,18 +763,60 @@ def create_app(
                 for msg in msgs:
                     if msg.get("mime_type") == "multi_load/iframe" and msg.get("content"):
                         current = msg["content"]
-                        # Compute delta (new text since last chunk)
+                        full_content = current
+
+                        if tool_mode:
+                            # Already in tool mode, just keep buffering
+                            continue
+
+                        # Check for tool call start in cumulative content
+                        if has_tools and not tool_mode:
+                            stripped = current.strip()
+                            if is_tool_call_start(stripped):
+                                tool_mode = True
+                                tool_content_start = 0
+                                continue
+
+                        # Normal content: compute and emit delta
                         if len(current) > len(prev_content):
                             delta_text = current[len(prev_content):]
                             prev_content = current
                             delta_chunk = _make_chunk({"content": delta_text})
                             yield f"data: {json.dumps(delta_chunk, ensure_ascii=False)}\n\n"
+
         except Exception as e:
             log.error("Qianwen stream error: %s", e)
             err_chunk = _make_chunk({"content": f"[Stream error: {e}]"})
             yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
 
-        # Final chunk with usage (if available)
+        # After stream ends: check if we buffered tool calls
+        if tool_mode and has_tools:
+            parsed = parse_tool_calls_xml(full_content)
+            if parsed:
+                # Emit tool_calls in OpenAI streaming format
+                for idx, tc in enumerate(parsed):
+                    tc_delta = {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "index": idx,
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["function"]["name"],
+                                "arguments": tc["function"]["arguments"],
+                            },
+                        }],
+                    }
+                    yield f"data: {json.dumps(_make_chunk(tc_delta), ensure_ascii=False)}\n\n"
+
+                # Final chunk
+                final_chunk = _make_chunk({}, finish_reason="tool_calls")
+                yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+        # Normal finish
         final_chunk = _make_chunk({}, finish_reason="stop")
         yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
