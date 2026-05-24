@@ -192,7 +192,7 @@ class QianwenClient:
                 messages: [{
                     mime_type: "text/plain",
                     content: content,
-                    meta_data: { ori_query: content },
+                    meta_data: { ori_query: content.slice(0, 1000) },
                     status: "complete"
                 }],
                 scene: "chat",
