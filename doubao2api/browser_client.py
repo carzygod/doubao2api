@@ -15,8 +15,10 @@ and call this signing function. All actual API traffic goes through httpx.
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
+from pathlib import Path
 from typing import AsyncGenerator, Optional, Dict, Any, List
 from urllib.parse import urlencode
 
@@ -31,6 +33,16 @@ CHAT_URL = f"{DOUBAO_URL}/chat/"
 COMPLETION_URL = f"{DOUBAO_URL}/chat/completion"
 SAMANTHA_COMPLETION_URL = f"{DOUBAO_URL}/samantha/chat/completion"
 DEFAULT_BOT_ID = "7338286299411103781"
+DEFAULT_PC_VERSION = os.environ.get("DOUBAO_PC_VERSION", "3.22.5")
+DEFAULT_VERSION_CODE = os.environ.get("DOUBAO_VERSION_CODE", "20800")
+DEFAULT_TIMEZONE = os.environ.get("DOUBAO_TIMEZONE", "Asia/Tokyo")
+DEFAULT_USER_AGENT = os.environ.get(
+    "DOUBAO_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36",
+)
+DEFAULT_SESSION_FILE = os.environ.get("DOUBAO_SESSION_FILE", "/app/data/.doubao_session.json")
 
 
 class BrowserClient:
@@ -47,6 +59,9 @@ class BrowserClient:
         self._device_id: Optional[str] = None
         self._web_id: Optional[str] = None
         self._fp: Optional[str] = None
+        self._region: str = ""
+        self._sys_region: str = ""
+        self._is_old_user: bool = True
         # msToken rotation: updated from x-ms-token response header
         self._ms_token: str = ""
         # Robustness: failure tracking
@@ -117,6 +132,8 @@ class BrowserClient:
                 args=launch_args,
                 viewport={"width": 1280, "height": 720},
                 locale="zh-CN",
+                timezone_id=DEFAULT_TIMEZONE,
+                user_agent=DEFAULT_USER_AGENT,
             )
             self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
         else:
@@ -124,7 +141,10 @@ class BrowserClient:
                 headless=self.headless, args=launch_args,
             )
             self._context = await browser.new_context(
-                viewport={"width": 1280, "height": 720}, locale="zh-CN",
+                viewport={"width": 1280, "height": 720},
+                locale="zh-CN",
+                timezone_id=DEFAULT_TIMEZONE,
+                user_agent=DEFAULT_USER_AGENT,
             )
             self._page = await self._context.new_page()
 
@@ -132,9 +152,11 @@ class BrowserClient:
         stealth = Stealth(navigator_languages_override=("zh-CN", "zh"))
         await stealth.apply_stealth_async(self._page)
 
+        await self._load_saved_cookies()
+
         # Navigate
         log.info("Navigating to %s", CHAT_URL)
-        await self._page.goto(CHAT_URL, wait_until="load", timeout=60000)
+        await self._page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=60000)
         await asyncio.sleep(3)
 
         # Init httpx
@@ -208,7 +230,12 @@ class BrowserClient:
         log.info("Ready! device_id=%s, fetch_hook=%s", self._device_id, self._bridge_ready)
 
     async def _extract_params(self):
-        """Extract device_id, web_id, fp from localStorage/cookies."""
+        """Extract live device/web params from localStorage/cookies.
+
+        Doubao Web rotates several identifiers after login and after page-side
+        experiments load. Keeping startup values around causes stale requests,
+        so callers refresh these before every browser fetch.
+        """
         for _ in range(5):
             params = await self._page.evaluate("""() => {
                 const result = {};
@@ -224,16 +251,79 @@ class BrowserClient:
                     .map(c => c.trim())
                     .find(c => c.startsWith('s_v_web_id='));
                 result.fp = fpCookie ? fpCookie.split('=')[1] : '';
+                result.region = localStorage.getItem('flow_user_country') || '';
+                result.sys_region = result.region || '';
+                const userId = localStorage.getItem('flow_tea_user_id') || '';
+                result.is_old_user = userId
+                    ? localStorage.getItem(`ug_attribution_is_old_user_${userId}`) === 'true'
+                    : true;
                 return result;
             }""")
             self._device_id = params.get("device_id", "")
             self._web_id = params.get("web_id", "")
             self._fp = params.get("fp", "")
+            self._region = params.get("region", "") or ""
+            self._sys_region = params.get("sys_region", "") or self._region
+            self._is_old_user = bool(params.get("is_old_user", True))
             if self._device_id and self._web_id:
                 break
             await asyncio.sleep(1)
         log.info("Params: device_id=%s, web_id=%s, fp=%s",
                  self._device_id, self._web_id, self._fp[:20] if self._fp else "")
+
+    async def _refresh_runtime_params(self):
+        """Refresh volatile browser params before a request."""
+        if not self._page:
+            return
+        await self._extract_params()
+        await self._seed_ms_token()
+
+    async def _load_saved_cookies(self):
+        """Load cookies from DOUBAO_COOKIE or the session file into the context."""
+        if not self._context:
+            return
+        cookies: Dict[str, str] = {}
+        cookie_header = os.environ.get("DOUBAO_COOKIE", "").strip()
+        if cookie_header:
+            for part in cookie_header.split(";"):
+                if "=" not in part:
+                    continue
+                name, value = part.split("=", 1)
+                cookies[name.strip()] = value.strip()
+        else:
+            path = Path(DEFAULT_SESSION_FILE)
+            if path.exists():
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    raw = data.get("cookies", {})
+                    if isinstance(raw, dict):
+                        cookies = {str(k): str(v) for k, v in raw.items() if v}
+                except Exception as exc:
+                    log.warning("Failed to load session file %s: %s", path, exc)
+        if not cookies:
+            return
+        await self._context.add_cookies([
+            {"name": name, "value": value, "domain": ".doubao.com", "path": "/"}
+            for name, value in cookies.items()
+        ])
+        log.info("Loaded %d cookies into browser context", len(cookies))
+
+    async def _save_current_cookies(self):
+        """Persist browser cookies for restart recovery."""
+        if not self._context:
+            return
+        path = Path(DEFAULT_SESSION_FILE)
+        try:
+            cookies = await self._context.cookies("https://www.doubao.com")
+            data = {
+                "cookies": {c["name"]: c["value"] for c in cookies},
+                "saved_at": int(time.time()),
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            log.info("Saved %d cookies to %s", len(cookies), path)
+        except Exception as exc:
+            log.warning("Failed to save cookies to %s: %s", path, exc)
 
     async def _wait_for_signing(self):
         """Wait for bdms.frontierSign to become available (legacy, kept for upload signing)."""
@@ -344,11 +434,13 @@ class BrowserClient:
         log.info("Injected %d cookies into browser context", len(pw_cookies))
 
         # Reload page to pick up new session
-        await self._page.reload(wait_until="load", timeout=30000)
+        await self._page.reload(wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(3)
 
         # Re-check login state
         await self._check_login_state()
+        if self._ready:
+            await self._save_current_cookies()
         return self._ready
     # ------------------------------------------------------------------
     # Signing & Cookies
@@ -419,19 +511,20 @@ class BrowserClient:
             "device_platform": "web",
             "fp": self._fp or "",
             "language": "zh",
-            "pc_version": "3.19.4",
+            "pc_version": DEFAULT_PC_VERSION,
             "pkg_type": "release_version",
             "real_aid": "497858",
-            "region": "",
+            "region": self._region or "",
             "samantha_web": "1",
-            "sys_region": "",
+            "sys_region": self._sys_region or self._region or "",
             "tea_uuid": self._web_id or "",
             "use-olympus-account": "1",
-            "version_code": "20800",
+            "version_code": DEFAULT_VERSION_CODE,
             "web_id": self._web_id or "",
+            "web_platform": "browser",
             "web_tab_id": str(uuid.uuid4()),
         }
-        if self._ms_token:
+        if self._ms_token and os.environ.get("DOUBAO_INCLUDE_MSTOKEN", "false").lower() == "true":
             params["msToken"] = self._ms_token
         return params
 
@@ -475,6 +568,7 @@ class BrowserClient:
         if not self._ready:
             raise RuntimeError("Browser not ready - need login first")
 
+        await self._refresh_runtime_params()
         need_create = conversation_id is None or conversation_id == ""
         effective_bot_id = bot_id or DEFAULT_BOT_ID
         msg_uuid = str(uuid.uuid4())
@@ -517,13 +611,16 @@ class BrowserClient:
                 "from_suggest": False,
                 "is_regen": False,
                 "is_replace": False,
+                "is_from_click_option": False,
                 "disable_sse_cache": False,
                 "select_text_action": "",
+                "is_select_text": False,
                 "resend_for_regen": False,
                 "scene_type": 0,
                 "unique_key": str(uuid.uuid4()),
                 "start_seq": 0,
                 "need_create_conversation": need_create,
+                "conversation_init_option": {"need_ack_conversation": True},
                 "regen_query_id": [],
                 "edit_query_id": [],
                 "regen_instruction": "",
@@ -533,6 +630,7 @@ class BrowserClient:
                 "shared_app_id": "",
                 "sse_recv_event_options": {"support_chunk_delta": True},
                 "is_ai_playground": False,
+                "is_old_user": self._is_old_user,
                 "recovery_option": {
                     "is_recovery": False,
                     "req_create_time_sec": now_sec,
@@ -540,12 +638,14 @@ class BrowserClient:
                 },
                 "message_storage_type": 0,
             },
+            "user_context": [],
             "ext": {
                 "use_deep_think": str(use_deep_think),
                 "fp": self._fp or "",
-                "collection_id": "",
-                "commerce_credit_config_enable": "0",
                 "sub_conv_firstmet_type": "1" if need_create else "0",
+                "collection_id": "",
+                "conversation_init_option": json.dumps({"need_ack_conversation": True}),
+                "commerce_credit_config_enable": "0",
             },
         }
 
@@ -607,9 +707,17 @@ class BrowserClient:
     async def _browser_fetch_stream(
         self, url: str, payload: Dict[str, Any], request_id: str
     ):
-        """Execute fetch() inside browser page and stream SSE chunks via callback."""
+        """Execute fetch() inside browser page and push parsed SSE chunks.
+
+        The original implementation relied on ``page.expose_function`` and a
+        window callback. Doubao's SPA can replace the execution world after
+        login or route changes, leaving that callback undefined. Reading the
+        upstream stream directly inside ``page.evaluate`` is less real-time, but
+        it is much more reliable and still preserves event order.
+        """
         js_code = """
         async ([url, payloadJson, requestId]) => {
+            const chunks = [];
             try {
                 const csrf = document.cookie.match(/passport_csrf_token=([^;]+)/);
                 const csrfToken = csrf ? csrf[1] : '';
@@ -628,9 +736,8 @@ class BrowserClient:
                 });
                 if (!res.ok) {
                     const errBody = await res.text();
-                    await window.__doubaoStreamChunk(requestId,
-                        '__HTTP_ERROR__:' + res.status + ':' + errBody.slice(0, 500));
-                    return;
+                    chunks.push('__HTTP_ERROR__:' + res.status + ':' + errBody.slice(0, 500));
+                    return chunks;
                 }
                 const reader = res.body.getReader();
                 const decoder = new TextDecoder();
@@ -656,7 +763,7 @@ class BrowserClient:
                         try {
                             const obj = JSON.parse(dataStr);
                             obj._event = currentEvent;
-                            await window.__doubaoStreamChunk(requestId, JSON.stringify(obj));
+                            chunks.push(JSON.stringify(obj));
                         } catch(e) {}
                     }
                 }
@@ -669,20 +776,28 @@ class BrowserClient:
                             try {
                                 const obj = JSON.parse(dataStr);
                                 obj._event = currentEvent;
-                                await window.__doubaoStreamChunk(requestId, JSON.stringify(obj));
+                                chunks.push(JSON.stringify(obj));
                             } catch(e) {}
                         }
                     }
                 }
-                // Signal completion
-                await window.__doubaoStreamChunk(requestId, null);
+                return chunks;
             } catch(e) {
-                await window.__doubaoStreamChunk(requestId, '__ERROR__:' + e.message);
+                chunks.push('__ERROR__:' + e.message);
+                return chunks;
             }
         }
         """
         payload_json = json.dumps(payload, ensure_ascii=False)
-        await self._page.evaluate(js_code, [url, payload_json, request_id])
+        try:
+            chunks = await self._page.evaluate(js_code, [url, payload_json, request_id])
+            if chunks:
+                for chunk in chunks:
+                    await self._stream_queues[request_id].put(chunk)
+        finally:
+            queue = self._stream_queues.get(request_id)
+            if queue:
+                await queue.put(None)
 
     # ------------------------------------------------------------------
     # High-level chat helper
