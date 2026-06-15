@@ -43,6 +43,10 @@ DEFAULT_USER_AGENT = os.environ.get(
     "Chrome/131.0.0.0 Safari/537.36",
 )
 DEFAULT_SESSION_FILE = os.environ.get("DOUBAO_SESSION_FILE", "/app/data/.doubao_session.json")
+DEFAULT_CHROMIUM_EXECUTABLE_PATH = (
+    os.environ.get("DOUBAO_CHROMIUM_EXECUTABLE_PATH")
+    or os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
+)
 
 
 class BrowserClient:
@@ -124,12 +128,17 @@ class BrowserClient:
             "--no-default-browser-check",
             "--no-sandbox",
         ]
+        launch_options: Dict[str, Any] = {
+            "headless": self.headless,
+            "args": launch_args,
+        }
+        if DEFAULT_CHROMIUM_EXECUTABLE_PATH:
+            launch_options["executable_path"] = DEFAULT_CHROMIUM_EXECUTABLE_PATH
 
         if self.user_data_dir:
             self._context = await self._playwright.chromium.launch_persistent_context(
                 self.user_data_dir,
-                headless=self.headless,
-                args=launch_args,
+                **launch_options,
                 viewport={"width": 1280, "height": 720},
                 locale="zh-CN",
                 timezone_id=DEFAULT_TIMEZONE,
@@ -138,7 +147,7 @@ class BrowserClient:
             self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
         else:
             browser = await self._playwright.chromium.launch(
-                headless=self.headless, args=launch_args,
+                **launch_options,
             )
             self._context = await browser.new_context(
                 viewport={"width": 1280, "height": 720},

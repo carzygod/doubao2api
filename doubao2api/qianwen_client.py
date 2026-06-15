@@ -18,6 +18,7 @@ No login required for basic usage (temporary sessions).
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from typing import AsyncGenerator, Optional, Dict, Any
@@ -30,6 +31,10 @@ log = logging.getLogger(__name__)
 QIANWEN_URL = "https://www.qianwen.com"
 CHAT_URL = f"{QIANWEN_URL}/chat/"
 CHAT_API_URL = "https://chat2.qianwen.com/api/v2/chat"
+DEFAULT_CHROMIUM_EXECUTABLE_PATH = (
+    os.environ.get("QIANWEN_CHROMIUM_EXECUTABLE_PATH")
+    or os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
+)
 
 # Model mapping for Qianwen
 # modelCode values from https://chat2-api.qianwen.com/api/v1/model/list
@@ -100,12 +105,17 @@ class QianwenClient:
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
         ]
+        launch_options: Dict[str, Any] = {
+            "headless": self.headless,
+            "args": launch_args,
+        }
+        if DEFAULT_CHROMIUM_EXECUTABLE_PATH:
+            launch_options["executable_path"] = DEFAULT_CHROMIUM_EXECUTABLE_PATH
 
         if self.user_data_dir:
             self._context = await self._playwright.chromium.launch_persistent_context(
                 self.user_data_dir,
-                headless=self.headless,
-                args=launch_args,
+                **launch_options,
                 viewport={"width": 1280, "height": 800},
                 locale="zh-CN",
             )
@@ -116,7 +126,7 @@ class QianwenClient:
             )
         else:
             browser = await self._playwright.chromium.launch(
-                headless=self.headless, args=launch_args
+                **launch_options
             )
             self._context = await browser.new_context(
                 viewport={"width": 1280, "height": 800}, locale="zh-CN"
