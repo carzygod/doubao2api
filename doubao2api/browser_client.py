@@ -52,9 +52,17 @@ DEFAULT_CHROMIUM_EXECUTABLE_PATH = (
 class BrowserClient:
     """Manages Playwright for login and in-browser fetch for API calls."""
 
-    def __init__(self, headless: bool = True, user_data_dir: Optional[str] = None):
+    def __init__(
+        self,
+        headless: bool = True,
+        user_data_dir: Optional[str] = None,
+        session_file: Optional[str] = None,
+        cookie_header: Optional[str] = None,
+    ):
         self.headless = headless
         self.user_data_dir = user_data_dir
+        self.session_file = session_file or DEFAULT_SESSION_FILE
+        self.cookie_header = os.environ.get("DOUBAO_COOKIE", "").strip() if cookie_header is None else cookie_header.strip()
         self._playwright = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
@@ -136,6 +144,7 @@ class BrowserClient:
             launch_options["executable_path"] = DEFAULT_CHROMIUM_EXECUTABLE_PATH
 
         if self.user_data_dir:
+            self._clear_stale_profile_locks()
             self._context = await self._playwright.chromium.launch_persistent_context(
                 self.user_data_dir,
                 **launch_options,
@@ -172,6 +181,22 @@ class BrowserClient:
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(180, connect=10))
 
         await self._check_login_state()
+
+    def _clear_stale_profile_locks(self):
+        """Remove Chromium profile singleton locks left by a crashed/replaced container."""
+        if os.environ.get("DOUBAO_CLEAR_STALE_PROFILE_LOCKS", "true").lower() == "false":
+            return
+        if not self.user_data_dir:
+            return
+        profile = Path(self.user_data_dir)
+        for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+            path = profile / name
+            try:
+                if path.exists() or path.is_symlink():
+                    path.unlink()
+                    log.info("Removed stale Chromium profile lock: %s", path)
+            except Exception as exc:
+                log.warning("Failed to remove Chromium profile lock %s: %s", path, exc)
 
     async def stop(self):
         """Close browser and httpx client."""
@@ -288,11 +313,11 @@ class BrowserClient:
         await self._seed_ms_token()
 
     async def _load_saved_cookies(self):
-        """Load cookies from DOUBAO_COOKIE or the session file into the context."""
+        """Load cookies from the configured cookie header or session file into the context."""
         if not self._context:
             return
         cookies: Dict[str, str] = {}
-        cookie_header = os.environ.get("DOUBAO_COOKIE", "").strip()
+        cookie_header = self.cookie_header
         if cookie_header:
             for part in cookie_header.split(";"):
                 if "=" not in part:
@@ -300,7 +325,7 @@ class BrowserClient:
                 name, value = part.split("=", 1)
                 cookies[name.strip()] = value.strip()
         else:
-            path = Path(DEFAULT_SESSION_FILE)
+            path = Path(self.session_file)
             if path.exists():
                 try:
                     data = json.loads(path.read_text(encoding="utf-8"))
@@ -321,7 +346,7 @@ class BrowserClient:
         """Persist browser cookies for restart recovery."""
         if not self._context:
             return
-        path = Path(DEFAULT_SESSION_FILE)
+        path = Path(self.session_file)
         try:
             cookies = await self._context.cookies("https://www.doubao.com")
             data = {

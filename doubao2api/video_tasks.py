@@ -64,6 +64,7 @@ class VideoTaskStore:
                     prompt TEXT NOT NULL,
                     model TEXT,
                     provider_model TEXT,
+                    account_id TEXT,
                     ratio TEXT,
                     duration INTEGER,
                     ref_image_key TEXT,
@@ -80,6 +81,9 @@ class VideoTaskStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_video_tasks_status ON video_tasks(status)"
             )
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(video_tasks)").fetchall()}
+            if "account_id" not in cols:
+                conn.execute("ALTER TABLE video_tasks ADD COLUMN account_id TEXT")
 
     def mark_interrupted(self) -> None:
         now = int(time.time())
@@ -111,8 +115,8 @@ class VideoTaskStore:
                 """
                 INSERT INTO video_tasks (
                     task_id, created, updated, status, prompt, model, provider_model,
-                    ratio, duration, ref_image_key, request_json
-                ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
+                    account_id, ratio, duration, ref_image_key, request_json
+                ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -121,6 +125,7 @@ class VideoTaskStore:
                     params["prompt"],
                     params.get("model"),
                     params.get("provider_model"),
+                    params.get("account_id"),
                     params.get("ratio"),
                     params.get("duration"),
                     params.get("ref_image_key"),

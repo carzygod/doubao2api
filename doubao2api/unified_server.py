@@ -28,6 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from .account_manager import DoubaoAccountManager, account_data_root
 from .browser_client import BrowserClient
 from .qianwen_client import QianwenClient, QIANWEN_MODELS
 from .video_tasks import VideoTaskStore, video_task_db_path
@@ -213,6 +214,7 @@ class ChatCompletionRequest(BaseModel):
     model: str = "doubao"
     messages: List[_Message]
     stream: bool = False
+    account_id: Optional[str] = None
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     conversation_id: Optional[str] = None
@@ -232,6 +234,7 @@ class ImageGenerationRequest(BaseModel):
     ratio: Optional[str] = None
     ref_image_key: Optional[str] = None
     response_format: Optional[str] = "url"
+    account_id: Optional[str] = None
 
 # ── Application factory ──────────────────────────────────────
 
@@ -243,27 +246,27 @@ def create_app(
 ) -> FastAPI:
     """Build and return a configured FastAPI application."""
 
-    _browser: Dict[str, Any] = {}  # holds BrowserClient instance
+    headless = os.environ.get("DOUBAO_HEADLESS", "true").lower() == "true"
+    accounts = DoubaoAccountManager(headless=headless)
     _qianwen: Dict[str, Any] = {}  # holds QianwenClient instance
 
     async def _browser_watchdog():
-        """Background task: check browser health every 30s, auto-restart on crash."""
+        """Background task: check hot account browser health every 30s."""
         while True:
             await asyncio.sleep(30)
-            client = _browser.get("client")
-            if client is None:
-                continue
-            try:
-                alive = await client.is_alive()
-                if not alive:
-                    log.error("Browser watchdog: process dead, restarting...")
-                    await client.restart()
-                    if client.is_ready:
-                        log.info("Browser watchdog: restart successful")
-                    else:
-                        log.warning("Browser watchdog: restarted but not logged in")
-            except Exception as e:
-                log.error("Browser watchdog error: %s", e)
+            for account_id, client in list(accounts.clients.items()):
+                try:
+                    alive = await client.is_alive()
+                    if not alive:
+                        log.error("Browser watchdog: account %s process dead, restarting...", account_id)
+                        await accounts.restart_client(account_id)
+                        fresh = accounts.clients.get(account_id)
+                        if fresh and fresh.is_ready:
+                            log.info("Browser watchdog: account %s restart successful", account_id)
+                        else:
+                            log.warning("Browser watchdog: account %s restarted but not logged in", account_id)
+                except Exception as e:
+                    log.error("Browser watchdog error for account %s: %s", account_id, e)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -271,22 +274,12 @@ def create_app(
         logging.getLogger("doubao2api.browser_client").setLevel(logging.INFO)
         logging.getLogger("doubao2api.browser_client").addHandler(logging.StreamHandler())
 
-        # Start browser client
-        headless = os.environ.get("DOUBAO_HEADLESS", "true").lower() == "true"
-        user_data_dir = os.environ.get(
-            "DOUBAO_BROWSER_DATA",
-            os.path.join(os.path.expanduser("~"), ".doubao_browser"),
-        )
-        client = BrowserClient(headless=headless, user_data_dir=user_data_dir)
-        await client.start()
-        _browser["client"] = client
-
-        if client.is_ready:
-            log.info("Browser client ready (already logged in)")
+        await accounts.start()
+        ready_accounts = [a for a in accounts.list_accounts() if a.get("runtime", {}).get("ready")]
+        if ready_accounts:
+            log.info("Doubao account pool ready: %d account(s)", len(ready_accounts))
         else:
-            log.warning(
-                "Browser not logged in. Visit /auth to scan QR code."
-            )
+            log.warning("No logged-in Doubao account. Visit /admin to add or scan account.")
 
         # Start browser watchdog
         watchdog_task = asyncio.create_task(_browser_watchdog())
@@ -312,9 +305,7 @@ def create_app(
 
         # Shutdown
         watchdog_task.cancel()
-        client = _browser.pop("client", None)
-        if client:
-            await client.stop()
+        await accounts.stop_all()
         qw = _qianwen.pop("client", None)
         if qw:
             await qw.stop()
@@ -364,21 +355,25 @@ def create_app(
         if token != api_key:
             raise HTTPException(status_code=401, detail="Invalid API key")
 
-    def _get_client() -> BrowserClient:
-        client = _browser.get("client")
-        if client is None:
-            raise HTTPException(status_code=503, detail="Browser not initialized")
-        if not client.is_ready:
-            raise HTTPException(
-                status_code=503,
-                detail="Not logged in. Visit /auth to scan QR code.",
-            )
-        if client.needs_captcha:
-            raise HTTPException(
-                status_code=503,
-                detail="Captcha verification required (710022004). Please complete captcha via VNC or re-login.",
-            )
-        return client
+    async def _get_account_client(
+        request: Optional[Request] = None,
+        body: Optional[Dict[str, Any]] = None,
+        account_id: Optional[str] = None,
+    ) -> tuple[Dict[str, Any], BrowserClient]:
+        preferred = account_id
+        if not preferred and body is not None:
+            headers = dict(request.headers) if request else {}
+            preferred = accounts.pick_account_id_from_request(headers, body)
+        elif not preferred and request is not None:
+            preferred = request.query_params.get("account_id") or request.query_params.get("doubao_account_id")
+            if not preferred:
+                preferred = accounts.pick_account_id_from_request(dict(request.headers), None)
+        try:
+            return await accounts.get_ready_client(preferred)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     def _truthy(value: Any) -> bool:
         if isinstance(value, bool):
@@ -438,9 +433,14 @@ def create_app(
             return True
         return any(_truthy(body.get(name)) for name in ("wait", "sync", "blocking"))
 
-    async def _execute_video_generation(params: Dict[str, Any]) -> Dict[str, Any]:
+    async def _execute_video_generation(params: Dict[str, Any], request: Optional[Request] = None) -> Dict[str, Any]:
         await bucket.acquire()
-        client = _get_client()
+        account, client = await _get_account_client(
+            request,
+            params,
+            account_id=params.get("account_id"),
+        )
+        params["account_id"] = account["id"]
         try:
             result = await client.generate_video_web(
                 prompt=params["prompt"],
@@ -450,16 +450,19 @@ def create_app(
                 duration=params.get("duration"),
             )
         except RuntimeError as exc:
+            accounts.mark_failure(account["id"], str(exc))
             raise RuntimeError(str(exc))
 
         videos = result.get("videos", [])
         msg = result.get("message", "")
         if not videos:
             raise RuntimeError(msg or "No videos generated")
+        accounts.mark_success(account["id"])
 
         response = {
             "created": int(time.time()),
             "data": videos,
+            "account_id": account["id"],
         }
         if msg:
             response["message"] = msg
@@ -478,6 +481,8 @@ def create_app(
         }
         if task.get("provider_model"):
             response["provider_model"] = task["provider_model"]
+        if task.get("account_id"):
+            response["account_id"] = task["account_id"]
         if task.get("ratio"):
             response["ratio"] = task["ratio"]
         if task.get("duration"):
@@ -658,13 +663,18 @@ def create_app(
 
     @app.get("/health")
     async def health():
-        client = _browser.get("client")
-        ready = client.is_ready if client else False
-        result = {"status": "ok" if ready else "not_ready", "logged_in": ready}
-        if client:
-            result["consecutive_failures"] = client.consecutive_failures
-            result["needs_captcha"] = client.needs_captcha
-            result["last_error_code"] = client.last_error_code
+        account_rows = accounts.list_accounts()
+        ready = any(a.get("runtime", {}).get("ready") for a in account_rows)
+        result = {
+            "status": "ok" if ready else "not_ready",
+            "logged_in": ready,
+            "accounts": {
+                "total": len(account_rows),
+                "ready": sum(1 for a in account_rows if a.get("runtime", {}).get("ready")),
+                "hot": sum(1 for a in account_rows if a.get("runtime", {}).get("hot")),
+                "counts": accounts.counts(),
+            },
+        }
         result["expert_degraded"] = _expert_tracker.is_degraded
         result["video_tasks"] = video_tasks.counts()
         # Qianwen status
@@ -708,7 +718,10 @@ def create_app(
                 raise HTTPException(status_code=400, detail="No text content")
 
         await bucket.acquire()
-        client = _get_client()
+        account, client = await _get_account_client(
+            request,
+            {"account_id": body.account_id} if body.account_id else None,
+        )
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
         if body.stream:
@@ -723,7 +736,8 @@ def create_app(
                 _stream_chat(client, prompt, use_deep_think, request_id, model_name,
                              conversation_id=body.conversation_id, bot_id=body.bot_id,
                              has_tools=has_tools,
-                             messages_for_counting=body.messages),
+                             messages_for_counting=body.messages,
+                             account_id=account["id"]),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -770,6 +784,7 @@ def create_app(
                 )
                 finish_reason = "stop"
         except RuntimeError as exc:
+            accounts.mark_failure(account["id"], str(exc))
             raise HTTPException(status_code=502, detail=str(exc))
 
         # max_tokens truncation (non-streaming only)
@@ -806,6 +821,7 @@ def create_app(
         }
         if message.get("conversation_id"):
             resp_data["conversation_id"] = message["conversation_id"]
+        accounts.mark_success(account["id"])
         return JSONResponse(resp_data)
 
     # ------------------------------------------------------------------
@@ -1123,7 +1139,10 @@ def create_app(
     async def image_generations(body: ImageGenerationRequest, request: Request):
         _check_auth(request)
         await bucket.acquire()
-        client = _get_client()
+        account, client = await _get_account_client(
+            request,
+            {"account_id": body.account_id} if body.account_id else None,
+        )
 
         ratio = body.ratio or _size_to_ratio(body.size)
 
@@ -1134,6 +1153,7 @@ def create_app(
                 ref_image_key=body.ref_image_key,
             )
         except RuntimeError as exc:
+            accounts.mark_failure(account["id"], str(exc))
             raise HTTPException(status_code=502, detail=str(exc))
 
         images = result.get("images", [])
@@ -1149,8 +1169,10 @@ def create_app(
                 "revised_prompt": body.prompt,
             })
 
+        accounts.mark_success(account["id"])
         return JSONResponse({
             "created": int(time.time()),
+            "account_id": account["id"],
             "data": data,
         })
 
@@ -1159,9 +1181,9 @@ def create_app(
     async def audio_generations(request: Request):
         _check_auth(request)
         await bucket.acquire()
-        client = _get_client()
 
         body = await request.json()
+        account, client = await _get_account_client(request, body)
         prompt = body.get("prompt", "")
         if not prompt:
             raise HTTPException(status_code=400, detail="Missing prompt")
@@ -1173,6 +1195,7 @@ def create_app(
                 genre=body.get("genre"),
             )
         except RuntimeError as exc:
+            accounts.mark_failure(account["id"], str(exc))
             raise HTTPException(status_code=502, detail=str(exc))
 
         tracks = result.get("tracks", [])
@@ -1181,15 +1204,17 @@ def create_app(
                 status_code=502, detail="No music tracks generated"
             )
 
+        accounts.mark_success(account["id"])
         return JSONResponse({
             "created": int(time.time()),
+            "account_id": account["id"],
             "data": tracks,
         })
 
-    async def _video_generations_sync(body: Dict[str, Any]) -> JSONResponse:
+    async def _video_generations_sync(body: Dict[str, Any], request: Optional[Request] = None) -> JSONResponse:
         params = _parse_video_request(body)
         try:
-            result = await _execute_video_generation(params)
+            result = await _execute_video_generation(params, request)
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
         return JSONResponse(result)
@@ -1198,7 +1223,7 @@ def create_app(
     async def video_generations_sync(request: Request):
         _check_auth(request)
         body = await request.json()
-        return await _video_generations_sync(body)
+        return await _video_generations_sync(body, request)
 
     @app.post("/v1/videos/generations")
     @app.post("/v1/video/generations")
@@ -1207,10 +1232,11 @@ def create_app(
         body = await request.json()
 
         if _wants_sync_video(body):
-            return await _video_generations_sync(body)
+            return await _video_generations_sync(body, request)
 
         params = _parse_video_request(body)
-        _get_client()
+        account, _ = await _get_account_client(request, body)
+        params["account_id"] = account["id"]
         task_id = f"video-{uuid.uuid4().hex}"
         task = video_tasks.create(task_id, params, body)
         asyncio.create_task(_run_video_task(task_id, params))
@@ -1230,7 +1256,7 @@ def create_app(
         """Upload a file. Returns file metadata for use in chat."""
         _check_auth(request)
         await bucket.acquire()
-        client = _get_client()
+        account, client = await _get_account_client(request)
 
         form = await request.form()
         file_field = form.get("file")
@@ -1243,8 +1269,10 @@ def create_app(
         try:
             result = await client.upload_file(file_data, filename)
         except RuntimeError as exc:
+            accounts.mark_failure(account["id"], str(exc))
             raise HTTPException(status_code=502, detail=str(exc))
 
+        accounts.mark_success(account["id"])
         return JSONResponse({
             "id": result["uri"],
             "object": "file",
@@ -1260,18 +1288,20 @@ def create_app(
     async def file_download(request: Request, uri: str, expire: int = 3600):
         _check_auth(request)
         await bucket.acquire()
-        client = _get_client()
+        account, client = await _get_account_client(request)
         try:
             url = await client.get_file_download_url(uri=uri, expire_seconds=expire)
         except RuntimeError as exc:
+            accounts.mark_failure(account["id"], str(exc))
             raise HTTPException(status_code=502, detail=str(exc))
+        accounts.mark_success(account["id"])
         return JSONResponse({"url": url, "uri": uri, "expires_in": expire})
 
     @app.post("/v1/images/upload")
     async def upload_image(request: Request):
         _check_auth(request)
         await bucket.acquire()
-        client = _get_client()
+        account, client = await _get_account_client(request)
         form = await request.form()
         upload = form.get("file") or form.get("image")
         if not upload:
@@ -1281,7 +1311,9 @@ def create_app(
         try:
             result = await client.upload_image(image_bytes=image_data, filename=filename)
         except RuntimeError as exc:
+            accounts.mark_failure(account["id"], str(exc))
             raise HTTPException(status_code=502, detail=str(exc))
+        accounts.mark_success(account["id"])
         return JSONResponse({
             "uri": result["uri"],
             "cdn_url": result["cdn_url"],
@@ -1297,9 +1329,9 @@ def create_app(
         """Chat with file attachment. Body: {file_id, prompt, model}."""
         _check_auth(request)
         await bucket.acquire()
-        client = _get_client()
 
         body = await request.json()
+        account, client = await _get_account_client(request, body)
         file_id = body.get("file_id", "")
         prompt = body.get("prompt", "")
         file_name = body.get("file_name", "file.txt")
@@ -1320,8 +1352,10 @@ def create_app(
                 use_deep_think=use_deep_think,
             )
         except RuntimeError as exc:
+            accounts.mark_failure(account["id"], str(exc))
             raise HTTPException(status_code=502, detail=str(exc))
 
+        accounts.mark_success(account["id"])
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         return JSONResponse({
             "id": request_id,
@@ -1456,6 +1490,7 @@ def create_app(
         bot_id: Optional[str] = None,
         has_tools: bool = False,
         messages_for_counting: Optional[list] = None,
+        account_id: Optional[str] = None,
     ):
         """Generate real-time SSE stream in OpenAI format via httpx streaming.
 
@@ -1735,6 +1770,8 @@ def create_app(
 
         except Exception as exc:
             log.error("Stream error: %s", exc)
+            if account_id:
+                accounts.mark_failure(account_id, str(exc))
             chunk = _make_chunk({"content": f"[Error: {exc}]"})
             yield f"data: {json.dumps(chunk)}\n\n"
 
@@ -1769,6 +1806,8 @@ def create_app(
 
         # Final chunk with usage
         client.record_success()
+        if account_id:
+            accounts.mark_success(account_id)
         # Report to expert tracker for degradation detection
         if has_tools and use_deep_think >= 1:
             _expert_tracker.report_response(had_reasoning_content)
@@ -1835,10 +1874,14 @@ def create_app(
             "rpm_limit": rpm_limit,
             "host": os.environ.get("DOUBAO_HOST", "0.0.0.0"),
             "port": int(os.environ.get("DOUBAO_PORT", "9090")),
+            "account_data_root": account_data_root(),
+            "account_db": accounts.store.path,
+            "default_account_id": accounts.default_account_id,
+            "max_hot_accounts": accounts.max_hot_accounts,
             "models": {
                 "chat": list(CHAT_MODELS.keys()),
                 "image": ["doubao-image"],
-                "video": ["doubao-video"],
+                "video": list(VIDEO_MODEL_ALIASES.keys()),
                 "audio": ["doubao-music"],
             },
         })
@@ -1849,75 +1892,197 @@ def create_app(
         _check_auth(request)
         return JSONResponse(list(_REQUEST_LOG))
 
+    async def _json_or_empty(request: Request) -> Dict[str, Any]:
+        try:
+            data = await request.json()
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _admin_account_id(request: Request, body: Optional[Dict[str, Any]] = None, fallback: Optional[str] = None) -> str:
+        body = body or {}
+        return (
+            fallback
+            or str(body.get("account_id") or body.get("doubao_account_id") or "")
+            or request.query_params.get("account_id")
+            or request.query_params.get("doubao_account_id")
+            or accounts.default_account_id
+        )
+
+    @app.get("/admin/api/accounts")
+    async def admin_accounts(request: Request):
+        _check_auth(request)
+        return JSONResponse({
+            "accounts": accounts.list_accounts(),
+            "default_account_id": accounts.default_account_id,
+            "max_hot_accounts": accounts.max_hot_accounts,
+        })
+
+    @app.post("/admin/api/accounts")
+    async def admin_create_account(request: Request):
+        _check_auth(request)
+        body = await _json_or_empty(request)
+        account = accounts.store.create_account(
+            name=str(body.get("name") or "").strip(),
+            account_id=str(body.get("id") or body.get("account_id") or "").strip(),
+        )
+        if body.get("start"):
+            try:
+                await accounts.ensure_client(account["id"])
+            except Exception as exc:
+                accounts.store.mark_failure(account["id"], str(exc), "error")
+        return JSONResponse(account)
+
+    @app.patch("/admin/api/accounts/{account_id}")
+    async def admin_update_account(account_id: str, request: Request):
+        _check_auth(request)
+        body = await _json_or_empty(request)
+        fields: Dict[str, Any] = {}
+        for key in ("name", "enabled", "proxy_url", "tags_json", "models_json", "quota_json"):
+            if key in body:
+                value = body[key]
+                if key.endswith("_json") and not isinstance(value, str):
+                    value = json.dumps(value, ensure_ascii=False)
+                fields[key] = value
+        account = accounts.store.update_account(account_id, **fields)
+        if account is None:
+            raise HTTPException(status_code=404, detail="Account not found")
+        if "enabled" in fields and not fields["enabled"]:
+            await accounts.stop_client(account_id)
+            account = accounts.store.get(account_id) or account
+        return JSONResponse(account)
+
+    @app.delete("/admin/api/accounts/{account_id}")
+    async def admin_delete_account(account_id: str, request: Request):
+        _check_auth(request)
+        await accounts.stop_client(account_id, update_status=False)
+        deleted = accounts.store.delete_account(account_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Account not found")
+        return JSONResponse({"status": "deleted", "account_id": account_id})
+
+    @app.post("/admin/api/accounts/{account_id}/start")
+    async def admin_start_account(account_id: str, request: Request):
+        _check_auth(request)
+        try:
+            account, client = await accounts.ensure_client(account_id)
+            return JSONResponse({
+                "status": "ready" if client.is_ready else "not_logged_in",
+                "account": accounts.store.get(account_id) or account,
+            })
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            return JSONResponse({"status": "error", "message": str(exc)}, status_code=502)
+
+    @app.post("/admin/api/accounts/{account_id}/stop")
+    async def admin_stop_account(account_id: str, request: Request):
+        _check_auth(request)
+        await accounts.stop_client(account_id)
+        return JSONResponse({"status": "stopped", "account_id": account_id})
+
+    @app.post("/admin/api/accounts/{account_id}/restart")
+    async def admin_restart_account(account_id: str, request: Request):
+        _check_auth(request)
+        try:
+            account, client = await accounts.restart_client(account_id)
+            return JSONResponse({
+                "status": "ready" if client.is_ready else "not_logged_in",
+                "account": accounts.store.get(account_id) or account,
+            })
+        except Exception as exc:
+            return JSONResponse({"status": "error", "message": str(exc)}, status_code=502)
+
     @app.get("/admin/api/cookies")
     async def admin_cookies(request: Request):
-        """Return current browser cookies."""
+        """Return browser cookies for one account."""
         _check_auth(request)
-        client = _browser.get("client")
-        if client is None or client._context is None:
-            return JSONResponse({"cookies": [], "total": 0})
+        account_id = _admin_account_id(request)
         try:
-            cookies = await client._context.cookies("https://www.doubao.com")
-            cookies_list = [
-                {"name": c["name"], "value": c["value"], "length": len(c["value"])}
-                for c in cookies
-            ]
-            return JSONResponse({"cookies": cookies_list, "total": len(cookies_list)})
-        except Exception:
-            return JSONResponse({"cookies": [], "total": 0})
+            cookies = await accounts.cookies(account_id)
+            return JSONResponse({"account_id": account_id, "cookies": cookies, "total": len(cookies)})
+        except Exception as exc:
+            return JSONResponse({"account_id": account_id, "cookies": [], "total": 0, "message": str(exc)})
+
+    @app.get("/admin/api/accounts/{account_id}/cookies")
+    async def admin_account_cookies(account_id: str, request: Request):
+        _check_auth(request)
+        try:
+            cookies = await accounts.cookies(account_id)
+            return JSONResponse({"account_id": account_id, "cookies": cookies, "total": len(cookies)})
+        except Exception as exc:
+            return JSONResponse({"account_id": account_id, "cookies": [], "total": 0, "message": str(exc)})
 
     @app.post("/admin/api/probe")
     async def admin_probe(request: Request):
         """Probe session by making a real chat request."""
         _check_auth(request)
-        client = _browser.get("client")
-        if client is None or not client.is_ready:
-            return JSONResponse({"status": "error", "message": "未登录"})
+        body = await _json_or_empty(request)
+        account_id = _admin_account_id(request, body)
+        return await _probe_account(account_id)
+
+    @app.post("/admin/api/accounts/{account_id}/probe")
+    async def admin_account_probe(account_id: str, request: Request):
+        _check_auth(request)
+        return await _probe_account(account_id)
+
+    async def _probe_account(account_id: str):
+        try:
+            account, client = await accounts.get_ready_client(account_id)
+        except Exception as exc:
+            return JSONResponse({"status": "error", "account_id": account_id, "message": str(exc)[:300]})
         try:
             t0 = time.time()
             result = await client.chat("1+1=?只回答数字", use_deep_think=0)
             ms = int((time.time() - t0) * 1000)
             content = result.get("text", "")
-            return JSONResponse({"status": "healthy", "ms": ms, "response": content[:100]})
-        except Exception as e:
-            return JSONResponse({"status": "error", "message": str(e)[:200]})
+            accounts.mark_success(account["id"])
+            return JSONResponse({"status": "healthy", "account_id": account["id"], "ms": ms, "response": content[:200]})
+        except Exception as exc:
+            accounts.mark_failure(account["id"], str(exc))
+            return JSONResponse({"status": "error", "account_id": account["id"], "message": str(exc)[:300]})
 
     @app.post("/auth/login")
     async def auth_login(request: Request):
-        """Trigger QR login flow. Returns status."""
+        """Trigger browser QR login flow for one account."""
         _check_auth(request)
-        client = _browser.get("client")
-        if client is None:
-            raise HTTPException(status_code=503, detail="Browser not initialized")
+        body = await _json_or_empty(request)
+        account_id = _admin_account_id(request, body)
+        try:
+            account, client = await accounts.ensure_client(account_id)
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         if client.is_ready:
-            return {"status": "already_logged_in"}
+            return {"status": "already_logged_in", "account_id": account["id"]}
+        asyncio.create_task(_do_login(account["id"], client))
+        return {"status": "login_started", "account_id": account["id"], "message": "QR code displayed in browser. Scan to login."}
 
-        # Start login (non-blocking, returns immediately)
-        asyncio.create_task(_do_login(client))
-        return {"status": "login_started", "message": "QR code displayed in browser. Scan to login."}
     @app.post("/auth/reset_captcha")
     async def reset_captcha(request: Request):
         """Reset captcha flag after manual verification via VNC."""
         _check_auth(request)
-        client = _browser.get("client")
-        if client is None:
-            raise HTTPException(status_code=503, detail="Browser not initialized")
+        body = await _json_or_empty(request)
+        account_id = _admin_account_id(request, body)
+        account, client = await accounts.ensure_client(account_id)
         client.record_success()
         if not client.is_ready:
             client._ready = True
-        return {"status": "ok", "message": "Captcha flag cleared, service resumed."}
+        accounts.mark_success(account["id"])
+        return {"status": "ok", "account_id": account["id"], "message": "Captcha flag cleared, service resumed."}
 
-
-    async def _do_login(client: BrowserClient):
+    async def _do_login(account_id: str, client: BrowserClient):
         """Background login task."""
         try:
             ok = await client.wait_for_login(timeout=120)
             if ok:
-                log.info("QR login successful via /auth")
+                accounts.mark_success(account_id)
+                log.info("QR login successful via /auth for account %s", account_id)
             else:
-                log.warning("QR login timed out")
+                accounts.store.mark_failure(account_id, "QR login timed out", "not_logged_in")
+                log.warning("QR login timed out for account %s", account_id)
         except Exception as exc:
-            log.error("QR login error: %s", exc)
+            accounts.mark_failure(account_id, str(exc))
+            log.error("QR login error for account %s: %s", account_id, exc)
 
     @app.get("/auth/status")
     async def auth_status(request: Request):
@@ -1927,55 +2092,59 @@ def create_app(
     async def admin_api_status(request: Request):
         return await _get_login_status(request)
 
+    @app.get("/admin/api/accounts/{account_id}/status")
+    async def admin_account_status(account_id: str, request: Request):
+        _check_auth(request)
+        try:
+            return JSONResponse(await accounts.login_status(account_id))
+        except Exception as exc:
+            return JSONResponse({"logged_in": False, "account_id": account_id, "browser": "not_started", "message": str(exc)})
+
     async def _get_login_status(request: Request):
         _check_auth(request)
-        client = _browser.get("client")
-        if client is None:
-            return {"logged_in": False, "browser": "not_started"}
-
-        page_url = client.page.url if client.page else ""
-        login_btn_count = 0
-        if client.page:
-            try:
-                login_btn = client.page.locator('button:has-text("登录")')
-                login_btn_count = await login_btn.count()
-            except Exception:
-                pass
-
-        actual_logged_in = client.is_ready and login_btn_count == 0
-
-        return {
-            "logged_in": actual_logged_in,
-            "is_ready_flag": client.is_ready,
-            "login_button_visible": login_btn_count > 0,
-            "page_url": page_url,
-            "device_id": client._device_id or "",
-            "web_id": client._web_id or "",
-        }
+        account_id = _admin_account_id(request)
+        try:
+            status = await accounts.login_status(account_id)
+        except Exception as exc:
+            return {"logged_in": False, "account_id": account_id, "browser": "not_started", "message": str(exc)}
+        status["accounts"] = accounts.counts()
+        return status
 
     @app.post("/auth/eval")
     async def auth_eval(request: Request):
         """Evaluate JS on the browser page (debug only)."""
         _check_auth(request)
-        client = _browser.get("client")
-        if client is None or client.page is None:
+        body = await _json_or_empty(request)
+        account_id = _admin_account_id(request, body)
+        _, client = await accounts.ensure_client(account_id)
+        if client.page is None:
             raise HTTPException(status_code=503, detail="Browser not available")
-        body = await request.json()
         js = body.get("js", "")
         if not js:
             raise HTTPException(status_code=400, detail="Missing 'js' field")
         try:
             result = await client.page.evaluate(js)
-            return {"result": result}
+            return {"account_id": account_id, "result": result}
         except Exception as e:
-            return {"error": str(e)}
+            return {"account_id": account_id, "error": str(e)}
 
     @app.get("/auth/screenshot")
     async def auth_screenshot(request: Request):
-        """Return a screenshot of the browser page (for remote QR viewing)."""
+        """Return a screenshot of the selected browser page."""
         _check_auth(request)
-        client = _browser.get("client")
-        if client is None or client.page is None:
+        account_id = _admin_account_id(request)
+        _, client = await accounts.ensure_client(account_id)
+        if client.page is None:
+            raise HTTPException(status_code=503, detail="Browser not available")
+        png_bytes = await client.page.screenshot()
+        from fastapi.responses import Response
+        return Response(content=png_bytes, media_type="image/png")
+
+    @app.get("/admin/api/accounts/{account_id}/screenshot")
+    async def admin_account_screenshot(account_id: str, request: Request):
+        _check_auth(request)
+        _, client = await accounts.ensure_client(account_id)
+        if client.page is None:
             raise HTTPException(status_code=503, detail="Browser not available")
         png_bytes = await client.page.screenshot()
         from fastapi.responses import Response
@@ -1983,51 +2152,71 @@ def create_app(
 
     # ── QR Login (pure HTTP, no VNC needed) ──
 
-    _qr_login_state: Dict[str, Any] = {}
+    _qr_login_states: Dict[str, Dict[str, Any]] = {}
+
+    @app.post("/admin/api/accounts/{account_id}/qr-login")
+    async def admin_account_qr_login_start(account_id: str, request: Request):
+        return await _start_qr_login(request, account_id)
+
+    @app.get("/admin/api/accounts/{account_id}/qr-login")
+    async def admin_account_qr_login_poll(account_id: str, request: Request):
+        return await _poll_qr_login(request, account_id)
 
     @app.post("/v1/session/qr-login")
     async def session_qr_login_start(request: Request):
+        body = await _json_or_empty(request)
+        account_id = _admin_account_id(request, body)
+        return await _start_qr_login(request, account_id)
+
+    @app.get("/v1/session/qr-login")
+    async def session_qr_login_poll(request: Request):
+        account_id = _admin_account_id(request)
+        return await _poll_qr_login(request, account_id)
+
+    async def _start_qr_login(request: Request, account_id: str):
         """Start QR login flow. Returns base64 QR code PNG."""
         _check_auth(request)
         from .qr_login import QRLogin, QRStatus
 
-        # Cancel any existing login
-        if _qr_login_state.get("instance"):
-            _qr_login_state["instance"].cancel()
+        if not accounts.store.get(account_id):
+            raise HTTPException(status_code=404, detail="Account not found")
+        await accounts.ensure_client(account_id)
+
+        state = _qr_login_states.setdefault(account_id, {})
+        if state.get("instance"):
+            state["instance"].cancel()
 
         qr = QRLogin()
-        _qr_login_state.clear()
-        _qr_login_state["instance"] = qr
-        _qr_login_state["status"] = "starting"
-        _qr_login_state["error"] = ""
+        state.clear()
+        state["instance"] = qr
+        state["status"] = "starting"
+        state["error"] = ""
+        state["account_id"] = account_id
 
         loop = asyncio.get_event_loop()
 
         def on_status(status: QRStatus, msg: str):
-            _qr_login_state["status"] = status.value
+            state["status"] = status.value
             if msg == "qr_ready":
-                _qr_login_state["qr_ready"] = True
+                state["qr_ready"] = True
 
         def on_done(result):
             if result.status == QRStatus.CONFIRMED:
-                _qr_login_state["status"] = "success"
-                _qr_login_state["cookies"] = result.cookies
-                # Inject cookies into Playwright browser
-                client = _browser.get("client")
-                if client:
-                    loop.call_soon_threadsafe(
-                        lambda: asyncio.ensure_future(
-                            _inject_qr_cookies(client, result.cookies)
-                        )
+                state["status"] = "success"
+                state["cookies"] = result.cookies
+                loop.call_soon_threadsafe(
+                    lambda: asyncio.ensure_future(
+                        _inject_qr_cookies(account_id, result.cookies)
                     )
-                log.info("QR login success: %d cookies", len(result.cookies))
+                )
+                log.info("QR login success for account %s: %d cookies", account_id, len(result.cookies))
             else:
-                _qr_login_state["status"] = "failed"
-                _qr_login_state["error"] = result.error
+                state["status"] = "failed"
+                state["error"] = result.error
+                accounts.store.mark_failure(account_id, result.error or "QR login failed", "not_logged_in")
 
         qr.start(on_status=on_status, on_done=on_done)
 
-        # Wait briefly for QR code to be generated
         for _ in range(20):
             await asyncio.sleep(0.1)
             if qr.qrcode_data:
@@ -2038,45 +2227,49 @@ def create_app(
             qr_b64 = b64.b64encode(qr.qrcode_data).decode()
             return JSONResponse({
                 "status": "qr_ready",
+                "account_id": account_id,
                 "qr_image_base64": qr_b64,
                 "message": "请用豆包 App 扫码。轮询 GET /v1/session/qr-login 获取状态。",
             })
-        else:
-            return JSONResponse({
-                "status": _qr_login_state.get("status", "error"),
-                "error": _qr_login_state.get("error", "生成二维码失败"),
-            }, status_code=502)
+        return JSONResponse({
+            "status": state.get("status", "error"),
+            "account_id": account_id,
+            "error": state.get("error", "生成二维码失败"),
+        }, status_code=502)
 
-    @app.get("/v1/session/qr-login")
-    async def session_qr_login_poll(request: Request):
-        """Poll QR login status."""
+    async def _poll_qr_login(request: Request, account_id: str):
         _check_auth(request)
-        status = _qr_login_state.get("status", "idle")
-        resp: Dict[str, Any] = {"status": status}
-
+        state = _qr_login_states.get(account_id, {})
+        status = state.get("status", "idle")
+        resp: Dict[str, Any] = {"status": status, "account_id": account_id}
         if status == "success":
             resp["message"] = "登录成功，session 已更新"
-            resp["cookies_count"] = len(_qr_login_state.get("cookies", {}))
+            resp["cookies_count"] = len(state.get("cookies", {}))
+            resp["browser_ready"] = state.get("browser_ready", False)
         elif status == "failed":
-            resp["error"] = _qr_login_state.get("error", "未知错误")
+            resp["error"] = state.get("error", "未知错误")
         elif status == "idle":
             resp["message"] = "无进行中的登录。POST /v1/session/qr-login 开始。"
-
         return JSONResponse(resp)
 
-    async def _inject_qr_cookies(client: BrowserClient, cookies: Dict[str, str]):
-        """Inject QR login cookies into Playwright and verify."""
+    async def _inject_qr_cookies(account_id: str, cookies: Dict[str, str]):
+        """Inject QR login cookies into the selected Playwright account and verify."""
+        state = _qr_login_states.setdefault(account_id, {"account_id": account_id})
         try:
+            _, client = await accounts.ensure_client(account_id)
             ok = await client.inject_cookies_and_reload(cookies)
             if ok:
-                log.info("QR cookies injected successfully, browser is ready")
-                _qr_login_state["browser_ready"] = True
+                accounts.mark_success(account_id)
+                log.info("QR cookies injected successfully for account %s", account_id)
+                state["browser_ready"] = True
             else:
-                log.warning("QR cookies injected but login check failed")
-                _qr_login_state["browser_ready"] = False
+                accounts.store.mark_failure(account_id, "QR cookies injected but login check failed", "not_logged_in")
+                log.warning("QR cookies injected but login check failed for account %s", account_id)
+                state["browser_ready"] = False
         except Exception as e:
-            log.error("Failed to inject QR cookies: %s", e)
-            _qr_login_state["browser_ready"] = False
+            accounts.mark_failure(account_id, str(e))
+            log.error("Failed to inject QR cookies for account %s: %s", account_id, e)
+            state["browser_ready"] = False
 
     return app
 
