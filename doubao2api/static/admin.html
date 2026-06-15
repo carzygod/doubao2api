@@ -217,6 +217,12 @@ pre.out{max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-wor
 .empty{padding:38px;text-align:center;color:var(--muted)}
 .split{display:flex;align-items:center;justify-content:space-between;gap:12px}
 .hint{font-size:12px;color:var(--dim);line-height:1.6}
+.quota-strip{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.quota-pill{border:1px solid rgba(41,64,87,.72);border-radius:var(--radius-sm);padding:8px;background:rgba(5,11,18,.46)}
+.quota-pill strong{display:block;font-size:14px}
+.quota-pill small{display:block;color:var(--dim);font-size:11px;margin-top:2px}
+.quota-pill.exhausted{border-color:rgba(255,102,117,.38);background:rgba(255,102,117,.08)}
+.quota-edit{margin-top:14px;border-top:1px solid rgba(41,64,87,.45);padding-top:14px}
 .loading-ribbon{position:fixed;inset:0 0 auto;z-index:80;height:3px;overflow:hidden;background:rgba(54,231,255,.08)}
 .loading-ribbon span{display:block;width:42%;height:100%;background:linear-gradient(90deg,transparent,var(--cyan),var(--blue),var(--violet),transparent);box-shadow:0 0 18px rgba(54,231,255,.62);animation:loadingSweep 1.1s var(--ease) infinite}
 @keyframes loadingSweep{from{transform:translateX(-100%)}to{transform:translateX(240%)}}
@@ -306,6 +312,16 @@ pre.out{max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-wor
                   <span v-if="account.runtime?.ready" class="badge ready">ready</span>
                   <span v-if="account.runtime?.needs_captcha" class="badge error">captcha</span>
                 </div>
+                <div class="quota-strip">
+                  <div :class="['quota-pill',{exhausted:quota(account,'image').exhausted}]">
+                    <strong>图片 {{quotaRemaining(account,'image')}}</strong>
+                    <small>已用 {{quota(account,'image').used || 0}} / {{quotaLimit(account,'image')}}</small>
+                  </div>
+                  <div :class="['quota-pill',{exhausted:quota(account,'video').exhausted}]">
+                    <strong>视频 {{quotaRemaining(account,'video')}}</strong>
+                    <small>已用 {{quota(account,'video').used || 0}} / {{quotaLimit(account,'video')}}</small>
+                  </div>
+                </div>
                 <div class="hint mono">{{account.last_error || account.runtime?.page_url || account.session_file}}</div>
               </div>
               <div v-if="!accounts.length" class="empty">暂无账号</div>
@@ -343,6 +359,27 @@ pre.out{max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-wor
             <div v-if="probeState.message" style="margin-top:14px">
               <span :class="['badge',probeState.status]">{{probeState.status}}</span>
               <span class="hint" style="margin-left:8px">{{probeState.message}}</span>
+            </div>
+            <div class="quota-edit">
+              <h3 style="margin-bottom:10px">24 小时配额</h3>
+              <div class="quota-strip" style="margin-bottom:12px">
+                <div :class="['quota-pill',{exhausted:quota(selectedAccount,'image').exhausted}]">
+                  <strong>图片剩余 {{quotaRemaining(selectedAccount,'image')}}</strong>
+                  <small>已用 {{quota(selectedAccount,'image').used || 0}} / {{quotaLimit(selectedAccount,'image')}}，重置 {{fmtTime(quota(selectedAccount,'image').reset_at)}}</small>
+                </div>
+                <div :class="['quota-pill',{exhausted:quota(selectedAccount,'video').exhausted}]">
+                  <strong>视频剩余 {{quotaRemaining(selectedAccount,'video')}}</strong>
+                  <small>已用 {{quota(selectedAccount,'video').used || 0}} / {{quotaLimit(selectedAccount,'video')}}，重置 {{fmtTime(quota(selectedAccount,'video').reset_at)}}</small>
+                </div>
+              </div>
+              <div class="form-grid">
+                <label>图片 24h 上限<input v-model.number="quotaForm.image_24h_limit" type="number" min="0" placeholder="默认 30"></label>
+                <label>视频 24h 上限<input v-model.number="quotaForm.video_24h_limit" type="number" min="0" placeholder="默认 10"></label>
+              </div>
+              <div class="actions" style="margin-top:12px">
+                <button class="btn" @click="saveQuota(selectedAccount.id)">保存配额</button>
+                <span class="hint">0 表示不限制；非 0 时用 24 小时滚动窗口过滤账号。</span>
+              </div>
             </div>
           </div>
         </div>
@@ -515,6 +552,7 @@ createApp({
     const qr=reactive({open:false,img:"",status:"",text:"",account_id:"",timer:null});
     const showVnc=ref(false);
     const test=reactive({account_id:"",model:"doubao",prompt:"你好，请只回复一句话确认你可用。",output:"",error:"",loading:false});
+    const quotaForm=reactive({image_24h_limit:30,video_24h_limit:10});
     const allModels=["doubao","doubao-pro","doubao-think","doubao-expert","doubao-image","doubao-music","doubao-video","seedance_v2.0","seedance-2.0-fast"];
     const title=computed(()=>tabs.find(t=>t.key===tab.value)?.name||"账号池");
     const selectedAccount=computed(()=>accounts.value.find(a=>a.id===selectedId.value)||null);
@@ -566,6 +604,17 @@ createApp({
       addModal.value=false;
       await loadAccounts();
       selectedId.value=account.id;
+    }
+    async function saveQuota(id){
+      const account=selectedAccount.value;
+      const quotaData={...(account?.quota||{})};
+      quotaData.image_24h_limit=Number(quotaForm.image_24h_limit)||0;
+      quotaData.video_24h_limit=Number(quotaForm.video_24h_limit)||0;
+      await api(`/admin/api/accounts/${encodeURIComponent(id)}`,{
+        method:"PATCH",
+        body:JSON.stringify({quota_json:quotaData})
+      });
+      await loadAccounts();
     }
     async function startAccount(id){await api(`/admin/api/accounts/${encodeURIComponent(id)}/start`,{method:"POST"});await loadAccounts()}
     async function stopAccount(id){await api(`/admin/api/accounts/${encodeURIComponent(id)}/stop`,{method:"POST"});await loadAccounts()}
@@ -662,15 +711,31 @@ createApp({
       const map={new:"新建",starting:"启动中",ready:"可用",not_logged_in:"未登录",captcha_required:"需验证",error:"异常",stopped:"已停止",disabled:"已禁用"};
       return map[a.status]||a.status||"未知";
     }
+    function quota(a,kind){return a?.quota_status?.[kind]||{}}
+    function quotaLimit(a,kind){
+      const q=quota(a,kind);
+      return q.limit>0?q.limit:"不限";
+    }
+    function quotaRemaining(a,kind){
+      const q=quota(a,kind);
+      if(!q.limit||q.limit<=0)return"不限";
+      return q.remaining ?? 0;
+    }
+    function syncQuotaForm(account){
+      if(!account)return;
+      quotaForm.image_24h_limit=account.quota?.image_24h_limit ?? account.quota_status?.image?.limit ?? 30;
+      quotaForm.video_24h_limit=account.quota?.video_24h_limit ?? account.quota_status?.video?.limit ?? 10;
+    }
     function fmtTime(ts){return ts?new Date(ts*1000).toLocaleString("zh-CN"):"-"}
     function fmtClock(ts){return ts?new Date(ts*1000).toLocaleTimeString("zh-CN",{hour12:false}):"-"}
+    watch(selectedAccount,account=>syncQuotaForm(account),{immediate:true});
     watch(selectedId,id=>{if(id)loadCookies(id)});
     onMounted(()=>{
       refreshAll();
       setInterval(()=>{if(tab.value==="logs")loadLogs()},5000);
       setInterval(()=>{loadAccounts()},15000);
     });
-    return{tabs,tab,title,busy,accounts,selectedId,selectedAccount,defaultAccountId,system,logs,addModal,newAccount,cookieData,screenshot,probeState,qr,showVnc,test,allModels,readyCount,hotCount,novncUrl,refreshAll,loadAccounts,selectAccount,openAdd,createAccount,startAccount,stopAccount,restartAccount,probe,loadCookies,takeScreenshot,startQr,closeQr,runTest,copy,statusText,fmtTime,fmtClock};
+    return{tabs,tab,title,busy,accounts,selectedId,selectedAccount,defaultAccountId,system,logs,addModal,newAccount,cookieData,screenshot,probeState,qr,showVnc,test,allModels,readyCount,hotCount,novncUrl,quotaForm,refreshAll,loadAccounts,selectAccount,openAdd,createAccount,saveQuota,startAccount,stopAccount,restartAccount,probe,loadCookies,takeScreenshot,startQr,closeQr,runTest,copy,statusText,quota,quotaLimit,quotaRemaining,fmtTime,fmtClock};
   }
 }).mount("#app");
 </script>

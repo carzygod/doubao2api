@@ -359,6 +359,8 @@ def create_app(
         request: Optional[Request] = None,
         body: Optional[Dict[str, Any]] = None,
         account_id: Optional[str] = None,
+        quota_kind: Optional[str] = None,
+        quota_units: int = 1,
     ) -> tuple[Dict[str, Any], BrowserClient]:
         preferred = account_id
         if not preferred and body is not None:
@@ -369,11 +371,51 @@ def create_app(
             if not preferred:
                 preferred = accounts.pick_account_id_from_request(dict(request.headers), None)
         try:
-            return await accounts.get_ready_client(preferred)
+            return await accounts.get_ready_client(
+                preferred,
+                quota_kind=quota_kind,
+                quota_units=quota_units,
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    def _looks_quota_error(message: str) -> bool:
+        text = (message or "").lower()
+        markers = (
+            "quota",
+            "limit",
+            "exceed",
+            "exceeded",
+            "insufficient",
+            "not enough",
+            "额度",
+            "次数",
+            "用完",
+            "不足",
+            "上限",
+            "今日剩余 0",
+            "剩余0",
+        )
+        return any(marker in text for marker in markers)
+
+    def _image_quota_units(body: ImageGenerationRequest) -> int:
+        try:
+            return max(1, int(body.n or 1))
+        except (TypeError, ValueError):
+            return 1
+
+    def _video_quota_units(params: Dict[str, Any]) -> int:
+        duration = params.get("duration")
+        if duration is None:
+            return 1
+        try:
+            duration_value = int(duration)
+        except (TypeError, ValueError):
+            return 1
+        # Doubao currently presents short video quota roughly as 5s=1, 10s=2.
+        return max(1, (duration_value + 4) // 5)
 
     def _truthy(value: Any) -> bool:
         if isinstance(value, bool):
@@ -435,12 +477,31 @@ def create_app(
 
     async def _execute_video_generation(params: Dict[str, Any], request: Optional[Request] = None) -> Dict[str, Any]:
         await bucket.acquire()
+        quota_units = int(params.get("quota_units") or _video_quota_units(params))
         account, client = await _get_account_client(
             request,
             params,
             account_id=params.get("account_id"),
+            quota_kind=None if params.get("quota_reservation_id") else "video",
+            quota_units=quota_units,
         )
         params["account_id"] = account["id"]
+        reservation_id = str(params.get("quota_reservation_id") or "")
+        if not reservation_id:
+            reservation_id = accounts.reserve_quota(
+                account["id"],
+                "video",
+                quota_units,
+                request_id=f"video-sync-{uuid.uuid4().hex}",
+                meta={
+                    "model": params.get("model"),
+                    "provider_model": params.get("provider_model"),
+                    "duration": params.get("duration"),
+                    "ratio": params.get("ratio"),
+                },
+            )
+            params["quota_reservation_id"] = reservation_id
+            params["quota_units"] = quota_units
         try:
             result = await client.generate_video_web(
                 prompt=params["prompt"],
@@ -450,19 +511,30 @@ def create_app(
                 duration=params.get("duration"),
             )
         except RuntimeError as exc:
+            accounts.release_quota(reservation_id)
+            if _looks_quota_error(str(exc)):
+                accounts.mark_quota_exhausted(account["id"], "video", str(exc))
             accounts.mark_failure(account["id"], str(exc))
             raise RuntimeError(str(exc))
+        except Exception:
+            accounts.release_quota(reservation_id)
+            raise
 
         videos = result.get("videos", [])
         msg = result.get("message", "")
         if not videos:
+            accounts.release_quota(reservation_id)
+            if _looks_quota_error(msg):
+                accounts.mark_quota_exhausted(account["id"], "video", msg)
             raise RuntimeError(msg or "No videos generated")
+        accounts.complete_quota(reservation_id)
         accounts.mark_success(account["id"])
 
         response = {
             "created": int(time.time()),
             "data": videos,
             "account_id": account["id"],
+            "quota": accounts.store.quota_snapshot(account, "video"),
         }
         if msg:
             response["message"] = msg
@@ -1139,9 +1211,19 @@ def create_app(
     async def image_generations(body: ImageGenerationRequest, request: Request):
         _check_auth(request)
         await bucket.acquire()
+        quota_units = _image_quota_units(body)
         account, client = await _get_account_client(
             request,
             {"account_id": body.account_id} if body.account_id else None,
+            quota_kind="image",
+            quota_units=quota_units,
+        )
+        reservation_id = accounts.reserve_quota(
+            account["id"],
+            "image",
+            quota_units,
+            request_id=f"image-{uuid.uuid4().hex}",
+            meta={"model": body.model, "n": body.n, "size": body.size, "ratio": body.ratio},
         )
 
         ratio = body.ratio or _size_to_ratio(body.size)
@@ -1153,11 +1235,18 @@ def create_app(
                 ref_image_key=body.ref_image_key,
             )
         except RuntimeError as exc:
+            accounts.release_quota(reservation_id)
+            if _looks_quota_error(str(exc)):
+                accounts.mark_quota_exhausted(account["id"], "image", str(exc))
             accounts.mark_failure(account["id"], str(exc))
             raise HTTPException(status_code=502, detail=str(exc))
+        except Exception:
+            accounts.release_quota(reservation_id)
+            raise
 
         images = result.get("images", [])
         if not images:
+            accounts.release_quota(reservation_id)
             raise HTTPException(
                 status_code=502, detail="No images generated"
             )
@@ -1169,10 +1258,12 @@ def create_app(
                 "revised_prompt": body.prompt,
             })
 
+        accounts.complete_quota(reservation_id)
         accounts.mark_success(account["id"])
         return JSONResponse({
             "created": int(time.time()),
             "account_id": account["id"],
+            "quota": accounts.store.quota_snapshot(account, "image"),
             "data": data,
         })
 
@@ -1235,10 +1326,34 @@ def create_app(
             return await _video_generations_sync(body, request)
 
         params = _parse_video_request(body)
-        account, _ = await _get_account_client(request, body)
+        quota_units = _video_quota_units(params)
+        account, _ = await _get_account_client(
+            request,
+            body,
+            quota_kind="video",
+            quota_units=quota_units,
+        )
         params["account_id"] = account["id"]
         task_id = f"video-{uuid.uuid4().hex}"
-        task = video_tasks.create(task_id, params, body)
+        params["quota_units"] = quota_units
+        params["quota_reservation_id"] = accounts.reserve_quota(
+            account["id"],
+            "video",
+            quota_units,
+            request_id=task_id,
+            meta={
+                "model": params.get("model"),
+                "provider_model": params.get("provider_model"),
+                "duration": params.get("duration"),
+                "ratio": params.get("ratio"),
+                "async": True,
+            },
+        )
+        try:
+            task = video_tasks.create(task_id, params, body)
+        except Exception:
+            accounts.release_quota(params["quota_reservation_id"])
+            raise
         asyncio.create_task(_run_video_task(task_id, params))
         return JSONResponse(_format_video_task(task))
 
@@ -1878,6 +1993,11 @@ def create_app(
             "account_db": accounts.store.path,
             "default_account_id": accounts.default_account_id,
             "max_hot_accounts": accounts.max_hot_accounts,
+            "quota": {
+                "window_seconds": accounts.store.quota_window_seconds(),
+                "image_24h_default": accounts.store.quota_limit({"id": "_default", "quota": {}}, "image"),
+                "video_24h_default": accounts.store.quota_limit({"id": "_default", "quota": {}}, "video"),
+            },
             "models": {
                 "chat": list(CHAT_MODELS.keys()),
                 "image": ["doubao-image"],

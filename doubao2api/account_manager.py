@@ -10,9 +10,12 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
-from .browser_client import BrowserClient, DEFAULT_SESSION_FILE
+if TYPE_CHECKING:
+    from .browser_client import BrowserClient
+
+DEFAULT_SESSION_FILE = os.environ.get("DOUBAO_SESSION_FILE", "/app/data/.doubao_session.json")
 
 
 ACCOUNT_STATUSES = {
@@ -25,6 +28,15 @@ ACCOUNT_STATUSES = {
     "stopped",
     "disabled",
 }
+
+QUOTA_KINDS = {"image", "video"}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
 
 
 def account_data_root() -> str:
@@ -122,6 +134,24 @@ class DoubaoAccountStore:
                     conn.execute(ddl)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_doubao_accounts_enabled ON doubao_accounts(enabled)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_doubao_accounts_status ON doubao_accounts(status)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS doubao_account_usage (
+                    id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    units INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'reserved',
+                    request_id TEXT,
+                    meta_json TEXT NOT NULL DEFAULT '{}',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_doubao_account_usage_window ON doubao_account_usage(account_id, kind, status, created_at)"
+            )
 
     def ensure_default_account(self) -> Dict[str, Any]:
         existing = self.get("default")
@@ -258,8 +288,191 @@ class DoubaoAccountStore:
             last_validated_at=_now(),
         )
 
+    def quota_limit(self, account: Dict[str, Any], kind: str) -> int:
+        quota = account.get("quota") or {}
+        if not isinstance(quota, dict):
+            quota = {}
+        aliases = (
+            f"{kind}_24h_limit",
+            f"{kind}_daily_quota",
+            f"{kind}_quota",
+            f"{kind}_limit",
+        )
+        for key in aliases:
+            value = quota.get(key)
+            if value not in (None, ""):
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+        if kind == "video":
+            return _env_int("DOUBAO_VIDEO_24H_QUOTA", _env_int("DOUBAO_VIDEO_DAILY_QUOTA", 10))
+        if kind == "image":
+            return _env_int("DOUBAO_IMAGE_24H_QUOTA", _env_int("DOUBAO_IMAGE_DAILY_QUOTA", 30))
+        return 0
+
+    def quota_window_seconds(self) -> int:
+        return max(60, _env_int("DOUBAO_QUOTA_WINDOW_SECONDS", 24 * 3600))
+
+    def quota_used(self, account_id: str, kind: str) -> int:
+        cutoff = _now() - self.quota_window_seconds()
+        with self._lock, self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(units), 0) AS used
+                  FROM doubao_account_usage
+                 WHERE account_id = ?
+                   AND kind = ?
+                   AND status IN ('reserved', 'completed')
+                   AND created_at >= ?
+                """,
+                (account_id, kind, cutoff),
+            ).fetchone()
+        return int(row["used"] or 0) if row else 0
+
+    def quota_snapshot(self, account: Dict[str, Any], kind: str) -> Dict[str, Any]:
+        limit = self.quota_limit(account, kind)
+        used = self.quota_used(account["id"], kind)
+        remaining = None if limit <= 0 else max(limit - used, 0)
+        reset_at = None
+        cutoff = _now() - self.quota_window_seconds()
+        with self._lock, self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT MIN(created_at) AS oldest
+                  FROM doubao_account_usage
+                 WHERE account_id = ?
+                   AND kind = ?
+                   AND status IN ('reserved', 'completed')
+                   AND created_at >= ?
+                """,
+                (account["id"], kind, cutoff),
+            ).fetchone()
+        if row and row["oldest"]:
+            reset_at = int(row["oldest"]) + self.quota_window_seconds()
+        return {
+            "kind": kind,
+            "limit": limit,
+            "used": used,
+            "remaining": remaining,
+            "window_seconds": self.quota_window_seconds(),
+            "reset_at": reset_at,
+            "exhausted": bool(limit > 0 and remaining is not None and remaining <= 0),
+        }
+
+    def quota_status(self, account: Dict[str, Any]) -> Dict[str, Any]:
+        return {kind: self.quota_snapshot(account, kind) for kind in sorted(QUOTA_KINDS)}
+
+    def has_quota(self, account: Dict[str, Any], kind: Optional[str], units: int = 1) -> bool:
+        if not kind:
+            return True
+        if kind not in QUOTA_KINDS:
+            return True
+        limit = self.quota_limit(account, kind)
+        if limit <= 0:
+            return True
+        return self.quota_used(account["id"], kind) + max(1, int(units)) <= limit
+
+    def reserve_quota(
+        self,
+        account_id: str,
+        kind: str,
+        units: int,
+        *,
+        request_id: str = "",
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        if kind not in QUOTA_KINDS:
+            return ""
+        account = self.get(account_id)
+        if not account:
+            raise RuntimeError(f"Account not found: {account_id}")
+        units = max(1, int(units))
+        if not self.has_quota(account, kind, units):
+            snapshot = self.quota_snapshot(account, kind)
+            raise RuntimeError(
+                f"Account {account_id} {kind} quota exhausted: "
+                f"{snapshot['used']}/{snapshot['limit']} used in 24h"
+            )
+        usage_id = f"usage-{uuid.uuid4().hex}"
+        now = _now()
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO doubao_account_usage (
+                    id, account_id, kind, units, status, request_id, meta_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?, ?)
+                """,
+                (
+                    usage_id,
+                    account_id,
+                    kind,
+                    units,
+                    request_id,
+                    json.dumps(meta or {}, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+        return usage_id
+
+    def complete_quota(self, usage_id: str) -> None:
+        if not usage_id:
+            return
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                "UPDATE doubao_account_usage SET status = 'completed', updated_at = ? WHERE id = ?",
+                (_now(), usage_id),
+            )
+
+    def release_quota(self, usage_id: str) -> None:
+        if not usage_id:
+            return
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                "UPDATE doubao_account_usage SET status = 'released', updated_at = ? WHERE id = ?",
+                (_now(), usage_id),
+            )
+
+    def release_reserved_usage(self) -> None:
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                "UPDATE doubao_account_usage SET status = 'released', updated_at = ? WHERE status = 'reserved'",
+                (_now(),),
+            )
+
+    def mark_quota_exhausted(self, account_id: str, kind: str, message: str = "") -> None:
+        account = self.get(account_id)
+        if not account or kind not in QUOTA_KINDS:
+            return
+        snapshot = self.quota_snapshot(account, kind)
+        remaining = snapshot.get("remaining")
+        if remaining is None:
+            remaining = 1
+        units = max(1, int(remaining))
+        now = _now()
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO doubao_account_usage (
+                    id, account_id, kind, units, status, request_id, meta_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'completed', ?, ?, ?, ?)
+                """,
+                (
+                    f"quota-exhausted-{uuid.uuid4().hex}",
+                    account_id,
+                    kind,
+                    units,
+                    "provider-quota-exhausted",
+                    json.dumps({"message": message[:500]}, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+
     def delete_account(self, account_id: str) -> bool:
         with self._lock, self._connection() as conn:
+            conn.execute("DELETE FROM doubao_account_usage WHERE account_id = ?", (account_id,))
             cur = conn.execute("DELETE FROM doubao_accounts WHERE id = ?", (account_id,))
             return cur.rowcount > 0
 
@@ -300,6 +513,7 @@ class DoubaoAccountManager:
 
     async def start(self) -> None:
         self.store.ensure_default_account()
+        self.store.release_reserved_usage()
         if os.environ.get("DOUBAO_AUTOSTART_DEFAULT_ACCOUNT", "true").lower() != "false":
             try:
                 await self.ensure_client(self.default_account_id)
@@ -326,6 +540,7 @@ class DoubaoAccountManager:
 
             self.store.update_account(account_id, status="starting", last_error="")
             cookie_header = os.environ.get("DOUBAO_COOKIE", "") if account_id == "default" else ""
+            from .browser_client import BrowserClient
             client = BrowserClient(
                 headless=self.headless,
                 user_data_dir=account["user_data_dir"],
@@ -353,16 +568,32 @@ class DoubaoAccountManager:
             await self.prune_idle(exclude={account_id})
             return self.store.get(account_id) or account, client
 
-    async def get_ready_client(self, preferred_account_id: Optional[str] = None) -> tuple[Dict[str, Any], BrowserClient]:
+    async def get_ready_client(
+        self,
+        preferred_account_id: Optional[str] = None,
+        *,
+        quota_kind: Optional[str] = None,
+        quota_units: int = 1,
+    ) -> tuple[Dict[str, Any], BrowserClient]:
         if preferred_account_id:
             account, client = await self.ensure_client(preferred_account_id)
             self._ensure_ready(account, client)
+            if not self.store.has_quota(account, quota_kind, quota_units):
+                snapshot = self.store.quota_snapshot(account, str(quota_kind))
+                raise RuntimeError(
+                    f"Account {account['id']} {quota_kind} quota exhausted: "
+                    f"{snapshot['used']}/{snapshot['limit']} used in 24h"
+                )
             self.last_touch[account["id"]] = time.time()
             return account, client
 
-        accounts = [a for a in self.store.list_accounts() if a.get("enabled")]
+        accounts = [
+            a
+            for a in self.store.list_accounts()
+            if a.get("enabled") and self.store.has_quota(a, quota_kind, quota_units)
+        ]
         if not accounts:
-            raise RuntimeError("No enabled Doubao accounts")
+            raise RuntimeError(f"No enabled Doubao accounts with available {quota_kind or 'general'} quota")
 
         hot_ready = []
         for account in accounts:
@@ -386,7 +617,7 @@ class DoubaoAccountManager:
             except Exception as exc:
                 last_error = str(exc)
                 continue
-        raise RuntimeError(last_error or "No ready Doubao accounts")
+        raise RuntimeError(last_error or f"No ready Doubao accounts with available {quota_kind or 'general'} quota")
 
     def _ensure_ready(self, account: Dict[str, Any], client: BrowserClient) -> None:
         if not client.is_ready:
@@ -433,6 +664,7 @@ class DoubaoAccountManager:
                 "page_url": client.page.url if client and client.page else "",
             }
             account["runtime"] = runtime
+            account["quota_status"] = self.store.quota_status(account)
             rows.append(account)
         return rows
 
@@ -457,6 +689,26 @@ class DoubaoAccountManager:
             if client.needs_captcha:
                 status = "captcha_required"
         self.store.mark_failure(account_id, message, status)
+
+    def reserve_quota(
+        self,
+        account_id: str,
+        kind: str,
+        units: int,
+        *,
+        request_id: str = "",
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        return self.store.reserve_quota(account_id, kind, units, request_id=request_id, meta=meta)
+
+    def complete_quota(self, usage_id: str) -> None:
+        self.store.complete_quota(usage_id)
+
+    def release_quota(self, usage_id: str) -> None:
+        self.store.release_quota(usage_id)
+
+    def mark_quota_exhausted(self, account_id: str, kind: str, message: str = "") -> None:
+        self.store.mark_quota_exhausted(account_id, kind, message)
 
     def pick_account_id_from_request(self, headers: Dict[str, str], body: Optional[Dict[str, Any]] = None) -> Optional[str]:
         body = body or {}
@@ -506,4 +758,3 @@ class DoubaoAccountManager:
     def export_public_account(self, account: Dict[str, Any]) -> Dict[str, Any]:
         data = dict(account)
         return data
-
