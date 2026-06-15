@@ -528,13 +528,21 @@ def create_app(
                 accounts.mark_quota_exhausted(account["id"], "video", msg)
             raise RuntimeError(msg or "No videos generated")
         accounts.complete_quota(reservation_id)
+        if msg:
+            accounts.update_provider_quota_from_text(
+                account["id"],
+                "video",
+                msg,
+                units_completed=quota_units,
+            )
         accounts.mark_success(account["id"])
+        refreshed_account = accounts.store.get(account["id"]) or account
 
         response = {
             "created": int(time.time()),
             "data": videos,
             "account_id": account["id"],
-            "quota": accounts.store.quota_snapshot(account, "video"),
+            "quota": accounts.store.quota_snapshot(refreshed_account, "video"),
         }
         if msg:
             response["message"] = msg
@@ -1260,10 +1268,11 @@ def create_app(
 
         accounts.complete_quota(reservation_id)
         accounts.mark_success(account["id"])
+        refreshed_account = accounts.store.get(account["id"]) or account
         return JSONResponse({
             "created": int(time.time()),
             "account_id": account["id"],
-            "quota": accounts.store.quota_snapshot(account, "image"),
+            "quota": accounts.store.quota_snapshot(refreshed_account, "image"),
             "data": data,
         })
 
@@ -2112,6 +2121,20 @@ def create_app(
             })
         except Exception as exc:
             return JSONResponse({"status": "error", "message": str(exc)}, status_code=502)
+
+    @app.post("/admin/api/accounts/{account_id}/quota/sync")
+    async def admin_sync_account_quota(account_id: str, request: Request):
+        _check_auth(request)
+        try:
+            result = await accounts.sync_provider_credit(account_id)
+            return JSONResponse({"status": "synced", **result})
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            return JSONResponse(
+                {"status": "error", "account_id": account_id, "message": str(exc)[:500]},
+                status_code=502,
+            )
 
     @app.get("/admin/api/cookies")
     async def admin_cookies(request: Request):

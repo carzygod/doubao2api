@@ -66,6 +66,15 @@ def _now() -> int:
     return int(time.time())
 
 
+def _safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    try:
+        if value in (None, ""):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _safe_id(value: str) -> str:
     value = value.strip().lower()
     value = re.sub(r"[^a-z0-9_-]+", "-", value)
@@ -330,10 +339,56 @@ class DoubaoAccountStore:
             ).fetchone()
         return int(row["used"] or 0) if row else 0
 
+    def provider_sync_status(self, account: Dict[str, Any]) -> Dict[str, Any]:
+        quota = account.get("quota") or {}
+        if not isinstance(quota, dict):
+            quota = {}
+        return {
+            "credit": quota.get("provider_credit") or {},
+            "quota": quota.get("provider_quota") or {},
+        }
+
+    def provider_quota_snapshot(self, account: Dict[str, Any], kind: str) -> Dict[str, Any]:
+        quota = account.get("quota") or {}
+        if not isinstance(quota, dict):
+            quota = {}
+        provider_quota = quota.get("provider_quota") or {}
+        if not isinstance(provider_quota, dict):
+            provider_quota = {}
+        raw = provider_quota.get(kind) or {}
+        if not isinstance(raw, dict):
+            return {}
+
+        remaining = _safe_int(raw.get("remaining"))
+        limit = _safe_int(raw.get("limit"))
+        synced_at = _safe_int(raw.get("synced_at"))
+        source = str(raw.get("source") or "")
+        ttl = _env_int("DOUBAO_PROVIDER_QUOTA_TTL_SECONDS", 24 * 3600)
+        stale = bool(ttl > 0 and synced_at and _now() - synced_at > ttl)
+        return {
+            "kind": kind,
+            "remaining": remaining,
+            "limit": limit,
+            "synced_at": synced_at,
+            "source": source,
+            "stale": stale,
+            "message": str(raw.get("message") or "")[:500],
+        }
+
     def quota_snapshot(self, account: Dict[str, Any], kind: str) -> Dict[str, Any]:
         limit = self.quota_limit(account, kind)
         used = self.quota_used(account["id"], kind)
         remaining = None if limit <= 0 else max(limit - used, 0)
+        provider = self.provider_quota_snapshot(account, kind)
+        provider_remaining = provider.get("remaining")
+        provider_stale = bool(provider.get("stale"))
+        effective_remaining = remaining
+        if provider_remaining is not None and not provider_stale:
+            effective_remaining = (
+                provider_remaining
+                if effective_remaining is None
+                else min(effective_remaining, provider_remaining)
+            )
         reset_at = None
         cutoff = _now() - self.quota_window_seconds()
         with self._lock, self._connection() as conn:
@@ -355,9 +410,14 @@ class DoubaoAccountStore:
             "limit": limit,
             "used": used,
             "remaining": remaining,
+            "effective_remaining": effective_remaining,
+            "provider": provider,
             "window_seconds": self.quota_window_seconds(),
             "reset_at": reset_at,
-            "exhausted": bool(limit > 0 and remaining is not None and remaining <= 0),
+            "exhausted": bool(
+                (limit > 0 and remaining is not None and remaining <= 0)
+                or (provider_remaining is not None and not provider_stale and provider_remaining <= 0)
+            ),
         }
 
     def quota_status(self, account: Dict[str, Any]) -> Dict[str, Any]:
@@ -368,10 +428,11 @@ class DoubaoAccountStore:
             return True
         if kind not in QUOTA_KINDS:
             return True
-        limit = self.quota_limit(account, kind)
-        if limit <= 0:
+        snapshot = self.quota_snapshot(account, kind)
+        effective_remaining = snapshot.get("effective_remaining")
+        if effective_remaining is None:
             return True
-        return self.quota_used(account["id"], kind) + max(1, int(units)) <= limit
+        return int(effective_remaining) >= max(1, int(units))
 
     def reserve_quota(
         self,
@@ -469,6 +530,106 @@ class DoubaoAccountStore:
                     now,
                 ),
             )
+
+    def update_provider_credit(self, account_id: str, sync_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        account = self.get(account_id)
+        if not account:
+            return None
+        quota = account.get("quota") or {}
+        if not isinstance(quota, dict):
+            quota = {}
+
+        credit_info = sync_data.get("credit_info") or {}
+        usage_history = sync_data.get("usage_history") or {}
+        provider_credit = {
+            "source": sync_data.get("source") or "doubao_credit_api",
+            "synced_at": _safe_int(sync_data.get("synced_at"), _now()),
+            "total_credit_num": _safe_int(credit_info.get("total_credit_num"), 0),
+            "credit_text": credit_info.get("credit_text") or "",
+            "credit_desc_text": credit_info.get("credit_desc_text") or "",
+            "history_has_more": bool(usage_history.get("has_more")),
+            "history_items": (usage_history.get("items") or [])[:20],
+        }
+        quota["provider_credit"] = provider_credit
+        return self.update_account(account_id, quota_json=json.dumps(quota, ensure_ascii=False))
+
+    def update_provider_quota(
+        self,
+        account_id: str,
+        kind: str,
+        *,
+        remaining: Optional[int],
+        limit: Optional[int] = None,
+        source: str = "message",
+        message: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        if kind not in QUOTA_KINDS or remaining is None:
+            return self.get(account_id)
+        account = self.get(account_id)
+        if not account:
+            return None
+        quota = account.get("quota") or {}
+        if not isinstance(quota, dict):
+            quota = {}
+        provider_quota = quota.get("provider_quota") or {}
+        if not isinstance(provider_quota, dict):
+            provider_quota = {}
+        current = provider_quota.get(kind) or {}
+        if not isinstance(current, dict):
+            current = {}
+        current_limit = _safe_int(current.get("limit"))
+        provider_quota[kind] = {
+            **current,
+            "remaining": max(0, int(remaining)),
+            "limit": _safe_int(limit, current_limit),
+            "source": source,
+            "synced_at": _now(),
+            "message": message[:500],
+        }
+        quota["provider_quota"] = provider_quota
+        return self.update_account(account_id, quota_json=json.dumps(quota, ensure_ascii=False))
+
+    def update_provider_quota_from_text(
+        self,
+        account_id: str,
+        kind: str,
+        text: str,
+        *,
+        units_completed: int = 0,
+    ) -> Optional[Dict[str, Any]]:
+        if not text:
+            return self.get(account_id)
+        patterns = [
+            r"(?:今日|今天)?\s*(?:剩余|还剩)\s*(\d+)\s*个?(?:视频生成额度|视频额度|生成额度)",
+            r"(?:视频生成额度|视频额度|生成额度)\s*(?:剩余|还剩)\s*(\d+)\s*个?",
+        ]
+        remaining: Optional[int] = None
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                remaining = _safe_int(match.group(1))
+                break
+        if remaining is None:
+            return self.get(account_id)
+
+        limit = None
+        account = self.get(account_id)
+        if account:
+            current = self.provider_quota_snapshot(account, kind)
+            current_limit = _safe_int(current.get("limit"))
+            if current_limit is not None:
+                limit = max(current_limit, remaining)
+        if limit is None and units_completed:
+            limit = remaining + max(0, int(units_completed))
+
+        return self.update_provider_quota(
+            account_id,
+            kind,
+            remaining=remaining,
+            limit=limit,
+            source="generation_message",
+            message=text,
+        )
 
     def delete_account(self, account_id: str) -> bool:
         with self._lock, self._connection() as conn:
@@ -665,6 +826,7 @@ class DoubaoAccountManager:
             }
             account["runtime"] = runtime
             account["quota_status"] = self.store.quota_status(account)
+            account["provider_sync"] = self.store.provider_sync_status(account)
             rows.append(account)
         return rows
 
@@ -709,6 +871,30 @@ class DoubaoAccountManager:
 
     def mark_quota_exhausted(self, account_id: str, kind: str, message: str = "") -> None:
         self.store.mark_quota_exhausted(account_id, kind, message)
+
+    def update_provider_quota_from_text(
+        self,
+        account_id: str,
+        kind: str,
+        text: str,
+        *,
+        units_completed: int = 0,
+    ) -> Optional[Dict[str, Any]]:
+        return self.store.update_provider_quota_from_text(
+            account_id,
+            kind,
+            text,
+            units_completed=units_completed,
+        )
+
+    async def sync_provider_credit(self, account_id: str) -> Dict[str, Any]:
+        account, client = await self.ensure_client(account_id)
+        self._ensure_ready(account, client)
+        sync_data = await client.get_credit_quota()
+        account = self.store.update_provider_credit(account_id, sync_data) or account
+        account["quota_status"] = self.store.quota_status(account)
+        account["provider_sync"] = self.store.provider_sync_status(account)
+        return {"account_id": account_id, "sync": sync_data, "account": account}
 
     def pick_account_id_from_request(self, headers: Dict[str, str], body: Optional[Dict[str, Any]] = None) -> Optional[str]:
         body = body or {}

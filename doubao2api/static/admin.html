@@ -223,6 +223,7 @@ pre.out{max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-wor
 .quota-pill small{display:block;color:var(--dim);font-size:11px;margin-top:2px}
 .quota-pill.exhausted{border-color:rgba(255,102,117,.38);background:rgba(255,102,117,.08)}
 .quota-edit{margin-top:14px;border-top:1px solid rgba(41,64,87,.45);padding-top:14px}
+.sync-box{margin-top:12px;border:1px solid rgba(41,64,87,.55);border-radius:var(--radius-md);background:rgba(5,11,18,.34);padding:12px}
 .loading-ribbon{position:fixed;inset:0 0 auto;z-index:80;height:3px;overflow:hidden;background:rgba(54,231,255,.08)}
 .loading-ribbon span{display:block;width:42%;height:100%;background:linear-gradient(90deg,transparent,var(--cyan),var(--blue),var(--violet),transparent);box-shadow:0 0 18px rgba(54,231,255,.62);animation:loadingSweep 1.1s var(--ease) infinite}
 @keyframes loadingSweep{from{transform:translateX(-100%)}to{transform:translateX(240%)}}
@@ -346,6 +347,7 @@ pre.out{max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-wor
               <button class="btn" @click="restartAccount(selectedAccount.id)">重启</button>
               <button class="btn" @click="stopAccount(selectedAccount.id)">停止</button>
               <button class="btn" @click="loadCookies(selectedAccount.id)">Cookies</button>
+              <button class="btn" @click="syncQuota(selectedAccount.id)" :disabled="probeState.loading">同步额度</button>
               <button class="btn" @click="takeScreenshot(selectedAccount.id)">截图</button>
             </div>
             <div class="grid" style="gap:0">
@@ -366,11 +368,18 @@ pre.out{max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-wor
                 <div :class="['quota-pill',{exhausted:quota(selectedAccount,'image').exhausted}]">
                   <strong>图片剩余 {{quotaRemaining(selectedAccount,'image')}}</strong>
                   <small>已用 {{quota(selectedAccount,'image').used || 0}} / {{quotaLimit(selectedAccount,'image')}}，重置 {{fmtTime(quota(selectedAccount,'image').reset_at)}}</small>
+                  <small v-if="providerQuota(selectedAccount,'image').remaining !== undefined">上游剩余 {{providerQuota(selectedAccount,'image').remaining}}，同步 {{fmtTime(providerQuota(selectedAccount,'image').synced_at)}}</small>
                 </div>
                 <div :class="['quota-pill',{exhausted:quota(selectedAccount,'video').exhausted}]">
                   <strong>视频剩余 {{quotaRemaining(selectedAccount,'video')}}</strong>
                   <small>已用 {{quota(selectedAccount,'video').used || 0}} / {{quotaLimit(selectedAccount,'video')}}，重置 {{fmtTime(quota(selectedAccount,'video').reset_at)}}</small>
+                  <small v-if="providerQuota(selectedAccount,'video').remaining !== undefined">上游剩余 {{providerQuota(selectedAccount,'video').remaining}}，同步 {{fmtTime(providerQuota(selectedAccount,'video').synced_at)}}</small>
                 </div>
+              </div>
+              <div class="sync-box">
+                <div class="kv"><span>豆包积分</span><strong>{{providerCredit(selectedAccount)}}</strong></div>
+                <div class="kv"><span>积分同步</span><span>{{fmtTime(selectedAccount.provider_sync?.credit?.synced_at)}}</span></div>
+                <div class="kv"><span>同步来源</span><span>{{selectedAccount.provider_sync?.credit?.source || '-'}}</span></div>
               </div>
               <div class="form-grid">
                 <label>图片 24h 上限<input v-model.number="quotaForm.image_24h_limit" type="number" min="0" placeholder="默认 30"></label>
@@ -616,6 +625,16 @@ createApp({
       });
       await loadAccounts();
     }
+    async function syncQuota(id){
+      probeState.loading=true;probeState.status="";probeState.message="";
+      try{
+        const r=await api(`/admin/api/accounts/${encodeURIComponent(id)}/quota/sync`,{method:"POST"});
+        const total=r.sync?.credit_info?.total_credit_num;
+        probeState.status=r.status||"synced";
+        probeState.message=`额度同步完成：豆包积分 ${total ?? "-"}`;
+      }catch(e){probeState.status="error";probeState.message=e.message}
+      finally{probeState.loading=false;await loadAccounts()}
+    }
     async function startAccount(id){await api(`/admin/api/accounts/${encodeURIComponent(id)}/start`,{method:"POST"});await loadAccounts()}
     async function stopAccount(id){await api(`/admin/api/accounts/${encodeURIComponent(id)}/stop`,{method:"POST"});await loadAccounts()}
     async function restartAccount(id){await api(`/admin/api/accounts/${encodeURIComponent(id)}/restart`,{method:"POST"});await loadAccounts()}
@@ -712,14 +731,21 @@ createApp({
       return map[a.status]||a.status||"未知";
     }
     function quota(a,kind){return a?.quota_status?.[kind]||{}}
+    function providerQuota(a,kind){return a?.quota_status?.[kind]?.provider||{}}
+    function providerCredit(a){
+      const value=a?.provider_sync?.credit?.total_credit_num;
+      return value===undefined||value===null?"-":value;
+    }
     function quotaLimit(a,kind){
       const q=quota(a,kind);
       return q.limit>0?q.limit:"不限";
     }
     function quotaRemaining(a,kind){
       const q=quota(a,kind);
+      const value=q.effective_remaining ?? q.remaining;
+      if(value!==undefined&&value!==null)return value;
       if(!q.limit||q.limit<=0)return"不限";
-      return q.remaining ?? 0;
+      return 0;
     }
     function syncQuotaForm(account){
       if(!account)return;
@@ -735,7 +761,7 @@ createApp({
       setInterval(()=>{if(tab.value==="logs")loadLogs()},5000);
       setInterval(()=>{loadAccounts()},15000);
     });
-    return{tabs,tab,title,busy,accounts,selectedId,selectedAccount,defaultAccountId,system,logs,addModal,newAccount,cookieData,screenshot,probeState,qr,showVnc,test,allModels,readyCount,hotCount,novncUrl,quotaForm,refreshAll,loadAccounts,selectAccount,openAdd,createAccount,saveQuota,startAccount,stopAccount,restartAccount,probe,loadCookies,takeScreenshot,startQr,closeQr,runTest,copy,statusText,quota,quotaLimit,quotaRemaining,fmtTime,fmtClock};
+    return{tabs,tab,title,busy,accounts,selectedId,selectedAccount,defaultAccountId,system,logs,addModal,newAccount,cookieData,screenshot,probeState,qr,showVnc,test,allModels,readyCount,hotCount,novncUrl,quotaForm,refreshAll,loadAccounts,selectAccount,openAdd,createAccount,saveQuota,syncQuota,startAccount,stopAccount,restartAccount,probe,loadCookies,takeScreenshot,startQr,closeQr,runTest,copy,statusText,quota,providerQuota,providerCredit,quotaLimit,quotaRemaining,fmtTime,fmtClock};
   }
 }).mount("#app");
 </script>

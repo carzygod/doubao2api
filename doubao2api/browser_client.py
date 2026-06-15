@@ -1001,6 +1001,101 @@ class BrowserClient:
                 pass
         return body
 
+    async def _browser_post_json(
+        self,
+        path: str,
+        payload: Dict[str, Any],
+        timeout: float = 30,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """POST JSON from inside the logged-in browser context."""
+        if not self._ready:
+            raise RuntimeError("Browser not ready - need login first")
+        if not self._page:
+            raise RuntimeError("Browser page not ready")
+
+        query_params = self._build_query_params()
+        separator = "&" if "?" in path else "?"
+        url = f"{path}{separator}{urlencode(query_params)}"
+        timeout_ms = int(timeout * 1000)
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        headers_json = json.dumps(extra_headers or {}, ensure_ascii=False)
+
+        js_code = """
+        async ([url, payloadJson, timeoutMs, headersJson]) => {
+            const csrf = document.cookie.match(/passport_csrf_token=([^;]+)/);
+            const csrfToken = csrf ? csrf[1] : '';
+            const extraHeaders = JSON.parse(headersJson || '{}');
+            const headers = {
+                'Content-Type': 'application/json',
+                'Agw-Js-Conv': 'str',
+                ...extraHeaders,
+            };
+            if (csrfToken) {
+                headers['x-tt-passport-csrf-token'] = csrfToken;
+            }
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers,
+                    body: payloadJson,
+                    credentials: 'include',
+                    signal: controller.signal,
+                });
+                clearTimeout(timer);
+                const text = await res.text();
+                let body = null;
+                try { body = text ? JSON.parse(text) : {}; }
+                catch { body = {raw: text}; }
+                return {ok: res.ok, status: res.status, body, text};
+            } catch (e) {
+                clearTimeout(timer);
+                return {ok: false, status: 0, body: {message: String(e && e.message || e)}, text: ''};
+            }
+        }
+        """
+        log.info("POST %s [browser json, timeout=%ds]", path.split("?")[0], timeout)
+        result = await self._page.evaluate(
+            js_code, [url, payload_json, timeout_ms, headers_json]
+        )
+        body = result.get("body") or {}
+        if not result.get("ok"):
+            raise RuntimeError(
+                f"{path} failed ({result.get('status', 0)}): "
+                f"{(result.get('text') or json.dumps(body, ensure_ascii=False))[:500]}"
+            )
+        if isinstance(body, dict) and int(body.get("code") or 0) != 0:
+            raise RuntimeError(
+                f"{path} returned code={body.get('code')}: "
+                f"{body.get('message') or body.get('msg') or body.get('error') or ''}"
+            )
+        return body
+
+    async def get_credit_quota(self) -> Dict[str, Any]:
+        """Fetch Doubao's own credit panel data for the current account."""
+        credit_body = await self._browser_post_json(
+            "/commerce/benefit_supply/credit/get_credit_num_optional_tasks",
+            {"need_tasks": True},
+            timeout=30,
+        )
+        history_body = await self._browser_post_json(
+            "/commerce/benefit_supply/credit/get_credit_usage_history",
+            {"size": 20, "transaction_type": 0},
+            timeout=30,
+        )
+        credit_data = credit_body.get("data") or {}
+        history_data = history_body.get("data") or {}
+        return {
+            "source": "doubao_credit_api",
+            "synced_at": int(time.time()),
+            "credit_info": credit_data.get("credit_info") or {},
+            "optional_tasks": credit_data.get("optional_tasks") or [],
+            "credit_rule_link": credit_data.get("credit_rule_link") or {},
+            "usage_history": history_data,
+        }
+
     @staticmethod
     def _parse_samantha_sse(raw: str) -> List[Dict[str, Any]]:
         """Parse samantha SSE body into list of event dicts."""
