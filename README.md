@@ -1556,6 +1556,67 @@ curl http://localhost:9090/v1/images/generations \
 
 #### POST /v1/video/generations
 
+Video generation now supports NewAPI-style asynchronous tasks by default.
+The create call returns a `task_id`; poll
+`GET /v1/video/generations/{task_id}` until `status` becomes `completed` or
+`failed`. The plural alias `POST /v1/videos/generations` and
+`GET /v1/videos/generations/{task_id}` are also available.
+
+Legacy synchronous callers can pass `wait: true`, `sync: true`,
+`blocking: true`, or `async: false`, or call
+`POST /v1/video/generations/sync`.
+
+Supported video request fields:
+
+| Field | Type | Required | Notes |
+|------|------|------|------|
+| `prompt` | string | yes | Video description. |
+| `model` | string | no | `doubao-video`, `seedance_v2.0`, `seedance2.0fast`, or `seedance-2.0-fast`. |
+| `video_model` / `provider_model` | string | no | Optional upstream model override. Doubao Web currently uses `seedance_v2.0` internally for Seedance 2.0 Fast. |
+| `ratio` / `aspect_ratio` | string | no | `1:1`, `16:9`, `9:16`; OpenAI-style `size` such as `1792x1024` is also mapped. |
+| `duration` / `duration_seconds` / `seconds` | number | no | Video duration in seconds. Defaults to `DOUBAO_VIDEO_DURATION` or `10`. |
+| `wait` / `sync` / `blocking` | boolean | no | Set true for legacy synchronous response. |
+
+Async create response:
+
+```json
+{
+  "id": "video-...",
+  "task_id": "video-...",
+  "object": "video.generation.task",
+  "created": 1700000000,
+  "updated": 1700000000,
+  "status": "queued",
+  "model": "doubao-video",
+  "prompt": "..."
+}
+```
+
+Completed task response:
+
+```json
+{
+  "id": "video-...",
+  "task_id": "video-...",
+  "object": "video.generation.task",
+  "created": 1700000000,
+  "updated": 1700000120,
+  "status": "completed",
+  "url": "https://...",
+  "data": [
+    {"video_url": "https://...", "cover_url": "https://...", "duration": 10.0, "width": 1920, "height": 1080}
+  ],
+  "output": [
+    {"video_url": "https://...", "cover_url": "https://...", "duration": 10.0, "width": 1920, "height": 1080}
+  ],
+  "result": {
+    "data": [
+      {"video_url": "https://...", "cover_url": "https://...", "duration": 10.0, "width": 1920, "height": 1080}
+    ]
+  }
+}
+```
+
 视频生成端点。当前接口会在请求内等待任务结果，成功后直接返回视频列表。
 
 **请求体**：

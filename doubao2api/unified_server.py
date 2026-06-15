@@ -30,6 +30,7 @@ from pydantic import BaseModel
 
 from .browser_client import BrowserClient
 from .qianwen_client import QianwenClient, QIANWEN_MODELS
+from .video_tasks import VideoTaskStore, video_task_db_path
 from .tool_calling import (
     build_tool_system_prompt,
     convert_messages_with_tools,
@@ -62,6 +63,18 @@ CHAT_MODELS: Dict[str, int] = {
     "doubao-expert": 3,
 }
 
+VIDEO_MODEL_ALIASES: Dict[str, Optional[str]] = {
+    "doubao-video": None,
+    "seedance_v2.0": "seedance_v2.0",
+    "seedance2.0": "seedance_v2.0",
+    "seedance2.0fast": "seedance_v2.0",
+    "seedance-2.0-fast": "seedance_v2.0",
+    "seedance_2.0_fast": "seedance_v2.0",
+    "seedance_v2.0_fast": "seedance_v2.0",
+    "Seedance 2.0": "seedance_v2.0",
+    "Seedance 2.0 Fast": "seedance_v2.0",
+}
+
 # Qianwen models (routed to QianwenClient)
 QIANWEN_MODEL_NAMES = set(QIANWEN_MODELS.keys())
 
@@ -74,7 +87,10 @@ ALL_MODELS = [
 ] + [
     {"id": "doubao-image", "object": "model", "owned_by": "doubao", "created": 0},
     {"id": "doubao-music", "object": "model", "owned_by": "doubao", "created": 0},
-    {"id": "doubao-video", "object": "model", "owned_by": "doubao", "created": 0},
+    *[
+        {"id": m, "object": "model", "owned_by": "doubao", "created": 0}
+        for m in VIDEO_MODEL_ALIASES
+    ],
 ]
 
 
@@ -150,6 +166,7 @@ def _size_to_ratio(size):
     if ":" in size:
         return size
     return "1:1"
+
 
 # ── Request log ring buffer ───────────────────────────────────
 
@@ -327,6 +344,9 @@ def create_app(
     )
 
     bucket = _TokenBucket(rpm_limit)
+    video_tasks = VideoTaskStore(video_task_db_path())
+    video_tasks.mark_interrupted()
+    video_tasks.cleanup()
 
     # ── Auth helper ──
 
@@ -359,6 +379,154 @@ def create_app(
                 detail="Captcha verification required (710022004). Please complete captcha via VNC or re-login.",
             )
         return client
+
+    def _truthy(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return False
+
+    def _normalize_video_duration(value: Any) -> Optional[int]:
+        if value in (None, ""):
+            return None
+        try:
+            duration = int(float(value))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="duration must be a number")
+        if duration <= 0:
+            raise HTTPException(status_code=400, detail="duration must be positive")
+        return duration
+
+    def _parse_video_request(body: Dict[str, Any]) -> Dict[str, Any]:
+        prompt = str(body.get("prompt") or body.get("input") or "").strip()
+        if not prompt:
+            raise HTTPException(status_code=400, detail="Missing prompt")
+
+        ratio = body.get("ratio") or body.get("aspect_ratio") or body.get("size")
+        if ratio and "x" in str(ratio):
+            ratio = _size_to_ratio(str(ratio))
+        if ratio is not None:
+            ratio = str(ratio)
+
+        model_name = str(body.get("model") or "doubao-video")
+        requested_model = body.get("video_model") or body.get("provider_model")
+        if not requested_model:
+            requested_model = VIDEO_MODEL_ALIASES.get(model_name)
+            if not requested_model and model_name.startswith("seedance"):
+                requested_model = model_name
+        if requested_model is not None:
+            requested_model = str(requested_model)
+
+        duration = _normalize_video_duration(
+            body.get("duration", body.get("duration_seconds", body.get("seconds")))
+        )
+
+        return {
+            "prompt": prompt,
+            "model": model_name,
+            "provider_model": requested_model,
+            "ratio": ratio,
+            "duration": duration,
+            "ref_image_key": body.get("ref_image_key") or body.get("image_key"),
+        }
+
+    def _wants_sync_video(body: Dict[str, Any]) -> bool:
+        if body.get("async") is False:
+            return True
+        return any(_truthy(body.get(name)) for name in ("wait", "sync", "blocking"))
+
+    async def _execute_video_generation(params: Dict[str, Any]) -> Dict[str, Any]:
+        await bucket.acquire()
+        client = _get_client()
+        try:
+            result = await client.generate_video_web(
+                prompt=params["prompt"],
+                ratio=params.get("ratio"),
+                ref_image_key=params.get("ref_image_key"),
+                model=params.get("provider_model"),
+                duration=params.get("duration"),
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(str(exc))
+
+        videos = result.get("videos", [])
+        msg = result.get("message", "")
+        if not videos:
+            raise RuntimeError(msg or "No videos generated")
+
+        response = {
+            "created": int(time.time()),
+            "data": videos,
+        }
+        if msg:
+            response["message"] = msg
+        return response
+
+    def _format_video_task(task: Dict[str, Any]) -> Dict[str, Any]:
+        response: Dict[str, Any] = {
+            "id": task["task_id"],
+            "task_id": task["task_id"],
+            "object": "video.generation.task",
+            "created": task["created"],
+            "updated": task["updated"],
+            "status": task["status"],
+            "model": task.get("model") or "doubao-video",
+            "prompt": task["prompt"],
+        }
+        if task.get("provider_model"):
+            response["provider_model"] = task["provider_model"]
+        if task.get("ratio"):
+            response["ratio"] = task["ratio"]
+        if task.get("duration"):
+            response["duration"] = task["duration"]
+        if task.get("message"):
+            response["message"] = task["message"]
+        if task.get("error"):
+            response["error"] = {
+                "message": task["error"],
+                "type": "api_error",
+                "code": "video_generation_failed",
+            }
+        if task.get("result_json"):
+            try:
+                result = json.loads(task["result_json"])
+            except json.JSONDecodeError:
+                result = {}
+            data = result.get("data") if isinstance(result, dict) else None
+            if data is not None:
+                response["data"] = data
+                response["output"] = data
+                response["result"] = {"data": data}
+                if data and isinstance(data, list) and isinstance(data[0], dict):
+                    first_url = data[0].get("video_url") or data[0].get("url")
+                    if first_url:
+                        response["url"] = first_url
+        return response
+
+    async def _run_video_task(task_id: str, params: Dict[str, Any]) -> None:
+        video_tasks.update(task_id, "in_progress")
+        try:
+            result = await _execute_video_generation(params)
+        except HTTPException as exc:
+            message = str(exc.detail)
+            log.warning("video task %s failed: %s", task_id, message)
+            video_tasks.update(task_id, "failed", error=message, message=message)
+            return
+        except Exception as exc:
+            message = str(exc)
+            log.warning("video task %s failed: %s", task_id, message)
+            video_tasks.update(task_id, "failed", error=message, message=message)
+            return
+        message = result.get("message", "")
+        video_tasks.update(
+            task_id,
+            "completed",
+            result_json=json.dumps(result, ensure_ascii=False),
+            message=message,
+        )
 
     def _get_qianwen_client() -> QianwenClient:
         client = _qianwen.get("client")
@@ -498,6 +666,7 @@ def create_app(
             result["needs_captcha"] = client.needs_captcha
             result["last_error_code"] = client.last_error_code
         result["expert_degraded"] = _expert_tracker.is_degraded
+        result["video_tasks"] = video_tasks.counts()
         # Qianwen status
         qw = _qianwen.get("client")
         result["qianwen_ready"] = qw.is_ready if qw else False
@@ -1017,46 +1186,44 @@ def create_app(
             "data": tracks,
         })
 
+    async def _video_generations_sync(body: Dict[str, Any]) -> JSONResponse:
+        params = _parse_video_request(body)
+        try:
+            result = await _execute_video_generation(params)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+        return JSONResponse(result)
+
+    @app.post("/v1/video/generations/sync")
+    async def video_generations_sync(request: Request):
+        _check_auth(request)
+        body = await request.json()
+        return await _video_generations_sync(body)
+
+    @app.post("/v1/videos/generations")
     @app.post("/v1/video/generations")
     async def video_generations(request: Request):
         _check_auth(request)
-        await bucket.acquire()
-        client = _get_client()
-
         body = await request.json()
-        prompt = body.get("prompt", "")
-        if not prompt:
-            raise HTTPException(status_code=400, detail="Missing prompt")
 
-        ratio = body.get("ratio") or body.get("size")
-        if ratio and "x" in str(ratio):
-            ratio = _size_to_ratio(ratio)
+        if _wants_sync_video(body):
+            return await _video_generations_sync(body)
 
-        try:
-            requested_model = body.get("video_model") or body.get("provider_model")
-            if not requested_model and str(body.get("model", "")).startswith("seedance"):
-                requested_model = body.get("model")
-            result = await client.generate_video_web(
-                prompt=prompt,
-                ratio=ratio,
-                ref_image_key=body.get("ref_image_key") or body.get("image_key"),
-                model=requested_model,
-                duration=body.get("duration"),
-            )
-        except RuntimeError as exc:
-            raise HTTPException(status_code=502, detail=str(exc))
+        params = _parse_video_request(body)
+        _get_client()
+        task_id = f"video-{uuid.uuid4().hex}"
+        task = video_tasks.create(task_id, params, body)
+        asyncio.create_task(_run_video_task(task_id, params))
+        return JSONResponse(_format_video_task(task))
 
-        videos = result.get("videos", [])
-        msg = result.get("message", "")
-        if not videos and msg:
-            raise HTTPException(status_code=502, detail=msg)
-        if not videos:
-            raise HTTPException(status_code=502, detail="No videos generated")
-
-        return JSONResponse({
-            "created": int(time.time()),
-            "data": videos,
-        })
+    @app.get("/v1/videos/generations/{task_id}")
+    @app.get("/v1/video/generations/{task_id}")
+    async def get_video_generation(task_id: str, request: Request):
+        _check_auth(request)
+        task = video_tasks.get(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Video task not found")
+        return JSONResponse(_format_video_task(task))
 
     @app.post("/v1/files")
     async def upload_file(request: Request):
