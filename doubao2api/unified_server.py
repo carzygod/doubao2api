@@ -1033,8 +1033,15 @@ def create_app(
             ratio = _size_to_ratio(ratio)
 
         try:
-            result = await client.generate_video(
-                prompt=prompt, ratio=ratio,
+            requested_model = body.get("video_model") or body.get("provider_model")
+            if not requested_model and str(body.get("model", "")).startswith("seedance"):
+                requested_model = body.get("model")
+            result = await client.generate_video_web(
+                prompt=prompt,
+                ratio=ratio,
+                ref_image_key=body.get("ref_image_key") or body.get("image_key"),
+                model=requested_model,
+                duration=body.get("duration"),
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
@@ -1042,7 +1049,7 @@ def create_app(
         videos = result.get("videos", [])
         msg = result.get("message", "")
         if not videos and msg:
-            return JSONResponse({"created": int(time.time()), "data": [], "message": msg})
+            raise HTTPException(status_code=502, detail=msg)
         if not videos:
             raise HTTPException(status_code=502, detail="No videos generated")
 

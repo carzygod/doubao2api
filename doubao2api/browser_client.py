@@ -563,6 +563,8 @@ class BrowserClient:
         conversation_id: Optional[str] = None,
         bot_id: Optional[str] = None,
         use_deep_think: int = 0,
+        chat_ability: Optional[Dict[str, Any]] = None,
+        stream_timeout: float = 180,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Send a chat message and yield SSE events via in-browser fetch."""
         if not self._ready:
@@ -648,6 +650,9 @@ class BrowserClient:
                 "commerce_credit_config_enable": "0",
             },
         }
+        if chat_ability:
+            payload["chat_ability"] = chat_ability
+            payload["ext"]["answer_with_suggest"] = "0"
 
         # Build URL with query params (fetch hook will add a_bogus/msToken)
         query_params = self._build_query_params()
@@ -669,7 +674,7 @@ class BrowserClient:
         # Yield parsed SSE events from queue
         try:
             while True:
-                chunk_json = await asyncio.wait_for(queue.get(), timeout=180)
+                chunk_json = await asyncio.wait_for(queue.get(), timeout=stream_timeout)
                 if chunk_json is None:
                     # Stream complete
                     break
@@ -691,7 +696,7 @@ class BrowserClient:
                 except json.JSONDecodeError:
                     continue
         except asyncio.TimeoutError:
-            log.error("Stream timeout (180s) for request %s", request_id)
+            log.error("Stream timeout (%ss) for request %s", stream_timeout, request_id)
             yield {"error": True, "status": 0, "body": "Stream timeout"}
         finally:
             self._stream_queues.pop(request_id, None)
@@ -1255,16 +1260,145 @@ class BrowserClient:
         log.info("generate_music: got %d tracks", len(tracks))
         return {"tracks": tracks, "prompt": prompt}
 
+    async def generate_video_web(
+        self,
+        prompt: str,
+        ratio: Optional[str] = None,
+        ref_image_key: Optional[str] = None,
+        model: Optional[str] = None,
+        duration: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Generate video through Doubao's current web chat ability path."""
+        import base64
+        import re
+
+        ability_param: Dict[str, Any] = {
+            "model": model or os.environ.get("DOUBAO_VIDEO_MODEL", "seedance_v2.0"),
+            "duration": int(duration or os.environ.get("DOUBAO_VIDEO_DURATION", "10")),
+        }
+        if ratio:
+            ability_param["ratio"] = ratio
+        if ref_image_key:
+            ability_param["ref_image_key"] = ref_image_key
+
+        chat_ability = {
+            "ability_type": 17,
+            "ability_param": json.dumps(ability_param, ensure_ascii=False),
+        }
+        text_prompt = prompt if prompt.strip().startswith("生成视频") else f"生成视频：{prompt}"
+
+        videos: List[Dict[str, Any]] = []
+        text_parts: List[str] = []
+
+        def maybe_json(value: Any) -> Any:
+            if not isinstance(value, str):
+                return value
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return value
+
+        def maybe_b64_url(value: Any) -> str:
+            if not isinstance(value, str) or len(value) < 16:
+                return ""
+            try:
+                decoded = base64.b64decode(value + "=" * (-len(value) % 4)).decode("utf-8", errors="ignore")
+            except Exception:
+                return ""
+            return decoded if decoded.startswith(("http://", "https://")) else ""
+
+        def add_video(url: str, item: Optional[Dict[str, Any]] = None) -> None:
+            if not url or not url.startswith(("http://", "https://")):
+                return
+            if re.search(r"\.(png|jpe?g|webp|gif)(~|\?|$)", url, re.I):
+                return
+            if not re.search(r"(\.mp4|\.m3u8|/video/|video)", url, re.I):
+                return
+            if any(v["video_url"] == url for v in videos):
+                return
+            item = item or {}
+            cover = item.get("cover", {})
+            videos.append({
+                "video_url": url,
+                "cover_url": item.get("cover_url", "") or item.get("poster", "") or (cover.get("url", "") if isinstance(cover, dict) else ""),
+                "width": item.get("width", 0) or item.get("video_width", 0),
+                "height": item.get("height", 0) or item.get("video_height", 0),
+                "duration": item.get("duration", 0.0) or item.get("video_duration", 0.0),
+            })
+
+        def walk(value: Any, parent: Optional[Dict[str, Any]] = None) -> None:
+            value = maybe_json(value)
+            if isinstance(value, dict):
+                text_block = value.get("text_block")
+                if isinstance(text_block, dict) and isinstance(text_block.get("text"), str):
+                    text_parts.append(text_block["text"])
+                content = maybe_json(value.get("content"))
+                if isinstance(content, dict):
+                    if isinstance(content.get("text"), str):
+                        text_parts.append(content["text"])
+                    walk(content, value)
+                for key in ("video_url", "url", "main_url", "play_url", "download_url"):
+                    raw = value.get(key)
+                    if isinstance(raw, str):
+                        add_video(raw, value)
+                        add_video(maybe_b64_url(raw), value)
+                vm = maybe_json(value.get("video_model"))
+                if isinstance(vm, dict):
+                    walk(vm, value)
+                for item in value.values():
+                    if item is not content and item is not vm:
+                        walk(item, value)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item, parent)
+
+        def fix_mojibake(text: str) -> str:
+            if not text or not any(marker in text for marker in ("鐢", "瑙", "鏈", "杩", "鍔", "棰")):
+                return text
+            if "鐢熸垚瑙嗛" in text and any(marker in text for marker in ("鍔¤繃杞", "璇风", "鍚庨噸")):
+                return "豆包视频生成已触发，但上游返回：服务过载，请稍后重试。"
+            for encoding in ("gb18030", "gbk"):
+                try:
+                    fixed = text.encode(encoding).decode("utf-8")
+                except Exception:
+                    continue
+                if any(marker in fixed for marker in ("生成", "视频", "服务", "重试", "额度")):
+                    return fixed
+            if any(marker in text for marker in ("杩囪", "繃杞", "璇风", "重璇")):
+                return "豆包视频生成已触发，但上游返回：服务过载，请稍后重试。"
+            return text
+
+        log.info("generate_video_web: prompt=%s, ability=%s", prompt[:50], ability_param)
+        async for event in self.chat_completion(
+            text_prompt,
+            use_deep_think=0,
+            chat_ability=chat_ability,
+            stream_timeout=float(os.environ.get("DOUBAO_VIDEO_TIMEOUT", "420")),
+        ):
+            if event.get("error"):
+                raise RuntimeError(
+                    f"API error {event.get('status')}: {event.get('body', '')[:500]}"
+                )
+            if isinstance(event.get("text"), str):
+                text_parts.append(event["text"])
+            walk(event)
+
+        full_text = fix_mojibake("".join(text_parts).strip())
+        log.info("generate_video_web: got %d videos; text=%s", len(videos), full_text[:120])
+        return {"videos": videos, "prompt": prompt, "message": full_text}
+
     async def generate_video(
         self,
         prompt: str,
         ratio: Optional[str] = None,
+        ref_image_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Generate video using /samantha/chat/completion (async 2-step).
 
         Args:
             prompt: Text description of the video to generate.
             ratio: Aspect ratio ("16:9", "9:16", "1:1").
+            ref_image_key: Optional uploaded image key to use as the first/reference frame.
 
         Returns:
             Dict with 'videos' list, each having video_url/cover_url/duration.
@@ -1274,6 +1408,8 @@ class BrowserClient:
         content_data: Dict[str, Any] = {"text": prompt}
         if ratio:
             content_data["ratio"] = ratio
+        if ref_image_key:
+            content_data["ref_image_key"] = ref_image_key
 
         message: Dict[str, Any] = {
             "content": json.dumps(content_data, ensure_ascii=False),
@@ -1287,6 +1423,11 @@ class BrowserClient:
                 "skill_id_no_default": "17",
             },
         }
+
+        if ref_image_key:
+            message["attachments"] = [
+                {"type": "image", "key": ref_image_key, "extra": {"refer_types": "overall"}}
+            ]
 
         payload = {
             "messages": [message],
