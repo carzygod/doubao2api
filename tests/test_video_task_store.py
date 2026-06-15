@@ -35,11 +35,17 @@ class VideoTaskStoreTest(unittest.TestCase):
             self.assertEqual(store.counts(), {"queued": 1})
 
             result = {"data": [{"video_url": "https://example.com/video.mp4"}]}
-            store.update("video-test", "completed", result_json=json.dumps(result))
+            store.update(
+                "video-test",
+                "completed",
+                result_json=json.dumps(result),
+                account_id="second-account",
+            )
             task = store.get("video-test")
 
             self.assertIsNotNone(task)
             self.assertEqual(task["status"], "completed")
+            self.assertEqual(task["account_id"], "second-account")
             self.assertEqual(json.loads(task["result_json"]), result)
 
     def test_mark_interrupted_tasks_failed(self):

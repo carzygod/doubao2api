@@ -138,7 +138,7 @@ class VideoTaskStore:
         return task
 
     def update(self, task_id: str, status: str, **fields: Any) -> None:
-        allowed = {"result_json", "error", "message"}
+        allowed = {"result_json", "error", "message", "account_id"}
         assignments = ["status = ?", "updated = ?"]
         values: list[Any] = [status, int(time.time())]
         for key, value in fields.items():

@@ -400,6 +400,23 @@ def create_app(
         )
         return any(marker in text for marker in markers)
 
+    class _VideoAttemptFailed(RuntimeError):
+        def __init__(self, account_id: str, message: str, retry_next_account: bool = False):
+            super().__init__(message)
+            self.account_id = account_id
+            self.retry_next_account = retry_next_account
+
+    def _request_has_account_selector(request: Optional[Request], body: Optional[Dict[str, Any]] = None) -> bool:
+        body = body or {}
+        if any(body.get(key) for key in ("account_id", "doubao_account_id", "account")):
+            return True
+        if not request:
+            return False
+        if request.query_params.get("account_id") or request.query_params.get("doubao_account_id"):
+            return True
+        headers = dict(request.headers)
+        return bool(accounts.pick_account_id_from_request(headers, None))
+
     def _image_quota_units(body: ImageGenerationRequest) -> int:
         try:
             return max(1, int(body.n or 1))
@@ -468,6 +485,8 @@ def create_app(
             "ratio": ratio,
             "duration": duration,
             "ref_image_key": body.get("ref_image_key") or body.get("image_key"),
+            "account_id": str(body.get("account_id") or body.get("doubao_account_id") or body.get("account") or "").strip() or None,
+            "explicit_account_id": bool(body.get("account_id") or body.get("doubao_account_id") or body.get("account")),
         }
 
     def _wants_sync_video(body: Dict[str, Any]) -> bool:
@@ -475,7 +494,51 @@ def create_app(
             return True
         return any(_truthy(body.get(name)) for name in ("wait", "sync", "blocking"))
 
-    async def _execute_video_generation(params: Dict[str, Any], request: Optional[Request] = None) -> Dict[str, Any]:
+    async def _probe_after_video_failure(account_id: str, client: BrowserClient, message: str) -> bool:
+        try:
+            result = await client.chat("1+1=?只回答数字", use_deep_think=0)
+            text = str(result.get("text") or "")
+            if text.strip():
+                return True
+        except Exception as exc:
+            log.warning("video failure probe failed for account %s: %s", account_id, exc)
+            accounts.mark_failure(account_id, f"video failed, probe failed: {exc}")
+            return False
+        log.warning("video failure probe returned empty response for account %s: %s", account_id, message)
+        accounts.mark_failure(account_id, "video failed, probe returned empty response")
+        return False
+
+    def _zero_video_quota(account_id: str, source: str, message: str) -> None:
+        accounts.mark_quota_exhausted(account_id, "video", message)
+        accounts.store.update_provider_quota(
+            account_id,
+            "video",
+            remaining=0,
+            source=source,
+            message=message,
+        )
+
+    async def _handle_video_attempt_failure(
+        account: Dict[str, Any],
+        client: BrowserClient,
+        reservation_id: str,
+        message: str,
+    ) -> bool:
+        accounts.release_quota(reservation_id)
+        message = message or "No videos generated"
+        retry_next = False
+        if _looks_quota_error(message):
+            _zero_video_quota(account["id"], "quota_error", message)
+            retry_next = True
+        else:
+            probe_ok = await _probe_after_video_failure(account["id"], client, message)
+            if not probe_ok:
+                _zero_video_quota(account["id"], "probe_failed_after_video_error", message)
+                retry_next = True
+        accounts.mark_failure(account["id"], message)
+        return retry_next
+
+    async def _execute_video_generation_once(params: Dict[str, Any], request: Optional[Request] = None) -> Dict[str, Any]:
         await bucket.acquire()
         quota_units = int(params.get("quota_units") or _video_quota_units(params))
         account, client = await _get_account_client(
@@ -511,22 +574,18 @@ def create_app(
                 duration=params.get("duration"),
             )
         except RuntimeError as exc:
-            accounts.release_quota(reservation_id)
-            if _looks_quota_error(str(exc)):
-                accounts.mark_quota_exhausted(account["id"], "video", str(exc))
-            accounts.mark_failure(account["id"], str(exc))
-            raise RuntimeError(str(exc))
-        except Exception:
+            retry_next = await _handle_video_attempt_failure(account, client, reservation_id, str(exc))
+            raise _VideoAttemptFailed(account["id"], str(exc), retry_next)
+        except Exception as exc:
             accounts.release_quota(reservation_id)
             raise
 
         videos = result.get("videos", [])
         msg = result.get("message", "")
         if not videos:
-            accounts.release_quota(reservation_id)
-            if _looks_quota_error(msg):
-                accounts.mark_quota_exhausted(account["id"], "video", msg)
-            raise RuntimeError(msg or "No videos generated")
+            message = msg or "No videos generated"
+            retry_next = await _handle_video_attempt_failure(account, client, reservation_id, message)
+            raise _VideoAttemptFailed(account["id"], message, retry_next)
         accounts.complete_quota(reservation_id)
         if msg:
             accounts.update_provider_quota_from_text(
@@ -547,6 +606,48 @@ def create_app(
         if msg:
             response["message"] = msg
         return response
+
+    async def _execute_video_generation(params: Dict[str, Any], request: Optional[Request] = None) -> Dict[str, Any]:
+        explicit_account = bool(params.get("explicit_account_id")) or _request_has_account_selector(request, None)
+        attempt_errors: list[str] = []
+        attempts = 0
+        while True:
+            attempts += 1
+            attempt_params = dict(params)
+            if attempts > 1:
+                attempt_params.pop("account_id", None)
+                attempt_params.pop("quota_reservation_id", None)
+            try:
+                result = await _execute_video_generation_once(attempt_params, request)
+                if attempt_errors:
+                    result["account_retry"] = {
+                        "attempts": attempts,
+                        "failed_accounts": attempt_errors,
+                    }
+                return result
+            except HTTPException as exc:
+                if attempt_errors:
+                    raise RuntimeError(
+                        "; ".join(attempt_errors) + f"; next account unavailable: {exc.detail}"
+                    ) from exc
+                raise
+            except _VideoAttemptFailed as exc:
+                attempt_errors.append(f"{exc.account_id}: {str(exc)[:220]}")
+                if explicit_account or not exc.retry_next_account:
+                    raise RuntimeError(str(exc))
+                params.pop("account_id", None)
+                params.pop("quota_reservation_id", None)
+                quota_units = int(params.get("quota_units") or _video_quota_units(params))
+                has_next_account = any(
+                    account.get("enabled") and accounts.store.has_quota(account, "video", quota_units)
+                    for account in accounts.store.list_accounts()
+                )
+                if not has_next_account:
+                    raise RuntimeError("; ".join(attempt_errors))
+                log.warning(
+                    "video generation failed on account %s; trying next available account",
+                    exc.account_id,
+                )
 
     def _format_video_task(task: Dict[str, Any]) -> Dict[str, Any]:
         response: Dict[str, Any] = {
@@ -585,6 +686,10 @@ def create_app(
                 response["data"] = data
                 response["output"] = data
                 response["result"] = {"data": data}
+                if result.get("account_id"):
+                    response["account_id"] = result.get("account_id")
+                if result.get("account_retry"):
+                    response["account_retry"] = result.get("account_retry")
                 if data and isinstance(data, list) and isinstance(data[0], dict):
                     first_url = data[0].get("video_url") or data[0].get("url")
                     if first_url:
@@ -611,6 +716,7 @@ def create_app(
             "completed",
             result_json=json.dumps(result, ensure_ascii=False),
             message=message,
+            account_id=result.get("account_id"),
         )
 
     def _get_qianwen_client() -> QianwenClient:
