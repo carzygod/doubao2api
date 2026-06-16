@@ -20,6 +20,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -242,6 +243,37 @@ class ImageGenerationRequest(BaseModel):
 # ── Application factory ──────────────────────────────────────
 
 
+def is_quota_exhaustion_message(message: str) -> bool:
+    text = (message or "").lower()
+    if re.search(r"(今日|今天)?\s*(剩余|还剩)\s*[1-9]\d*\s*个?(视频生成额度|视频额度|生成额度|额度)", text):
+        return False
+    if re.search(r"(今日|今天)?\s*(剩余|还剩)\s*0\s*个?(视频生成额度|视频额度|生成额度|额度)?", text):
+        return True
+    markers = (
+        "exceed",
+        "exceeded",
+        "insufficient",
+        "not enough",
+        "次数",
+        "用完",
+        "不足",
+        "上限",
+        "今日剩余 0",
+        "剩余0",
+        "还剩 0",
+        "还剩0",
+        "额度不足",
+        "额度已用完",
+        "视频生成额度已用完",
+        "quota exceeded",
+        "quota exhausted",
+        "quota insufficient",
+        "quota limit",
+        "rate limit",
+    )
+    return any(marker in text for marker in markers)
+
+
 def create_app(
     *,
     api_key: Optional[str] = None,
@@ -385,23 +417,7 @@ def create_app(
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     def _looks_quota_error(message: str) -> bool:
-        text = (message or "").lower()
-        markers = (
-            "quota",
-            "limit",
-            "exceed",
-            "exceeded",
-            "insufficient",
-            "not enough",
-            "额度",
-            "次数",
-            "用完",
-            "不足",
-            "上限",
-            "今日剩余 0",
-            "剩余0",
-        )
-        return any(marker in text for marker in markers)
+        return is_quota_exhaustion_message(message)
 
     class _VideoAttemptFailed(RuntimeError):
         def __init__(self, account_id: str, message: str, retry_next_account: bool = False):
