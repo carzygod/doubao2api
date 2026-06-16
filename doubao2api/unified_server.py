@@ -680,8 +680,11 @@ def create_app(
                     model=params.get("provider_model"),
                     duration=params.get("duration"),
                 )
-                if fallback.get("videos") or is_video_acceptance_message(str(fallback.get("message") or "")):
-                    fallback["message"] = result.get("message") or fallback.get("message", "")
+                if fallback.get("videos"):
+                    fallback["message"] = fallback.get("message") or result.get("message", "")
+                    result = fallback
+                elif is_video_acceptance_message(str(fallback.get("message") or "")):
+                    fallback["message"] = fallback.get("message") or result.get("message", "")
                     result = fallback
         except HTTPException:
             accounts.release_quota(reservation_id)
