@@ -681,7 +681,7 @@ def create_app(
                     duration=params.get("duration"),
                 )
                 if fallback.get("videos"):
-                    fallback["message"] = fallback.get("message") or result.get("message", "")
+                    fallback["message"] = fallback.get("message") or "completed"
                     result = fallback
                 elif is_video_acceptance_message(str(fallback.get("message") or "")):
                     fallback["message"] = fallback.get("message") or result.get("message", "")
@@ -796,7 +796,7 @@ def create_app(
             response["ratio"] = task["ratio"]
         if task.get("duration"):
             response["duration"] = task["duration"]
-        if task.get("message"):
+        if task.get("message") and not (status == "completed" and task.get("result_json")):
             response["message"] = task["message"]
         if task.get("error"):
             err_code = "quota_exhausted" if _looks_quota_error(str(task["error"])) else "video_generation_failed"
