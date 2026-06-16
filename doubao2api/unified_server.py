@@ -557,10 +557,27 @@ def create_app(
         client: BrowserClient,
         reservation_id: str,
         message: str,
+        quota_units: int = 1,
     ) -> bool:
         accounts.release_quota(reservation_id)
         message = message or "No videos generated"
         retry_next = False
+        refreshed = accounts.update_provider_quota_from_text(
+            account["id"],
+            "video",
+            message,
+            units_completed=0,
+        )
+        provider_remaining = None
+        if refreshed:
+            provider_remaining = accounts.store.provider_quota_snapshot(refreshed, "video").get("remaining")
+        if provider_remaining is not None:
+            try:
+                retry_next = int(provider_remaining) < max(1, int(quota_units))
+            except (TypeError, ValueError):
+                retry_next = False
+            accounts.mark_failure(account["id"], message)
+            return retry_next
         if _looks_quota_error(message):
             _zero_video_quota(account["id"], "quota_error", message)
             retry_next = True
@@ -662,7 +679,7 @@ def create_app(
             accounts.release_quota(reservation_id)
             raise
         except RuntimeError as exc:
-            retry_next = await _handle_video_attempt_failure(account, client, reservation_id, str(exc))
+            retry_next = await _handle_video_attempt_failure(account, client, reservation_id, str(exc), quota_units)
             raise _VideoAttemptFailed(account["id"], str(exc), retry_next)
         except Exception as exc:
             accounts.release_quota(reservation_id)
@@ -672,7 +689,7 @@ def create_app(
         msg = result.get("message", "")
         if not videos:
             message = msg or "No videos generated"
-            retry_next = await _handle_video_attempt_failure(account, client, reservation_id, message)
+            retry_next = await _handle_video_attempt_failure(account, client, reservation_id, message, quota_units)
             raise _VideoAttemptFailed(account["id"], message, retry_next)
         accounts.complete_quota(reservation_id)
         if msg:

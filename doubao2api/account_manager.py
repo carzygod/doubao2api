@@ -600,6 +600,8 @@ class DoubaoAccountStore:
         if not text:
             return self.get(account_id)
         patterns = [
+            r"(?:今日|今天)?\s*(?:剩余|还剩)\s*(\d+)\s*个?(?:视频生成额度|视频额度|生成额度|额度)",
+            r"(?:视频生成额度|视频额度|生成额度|额度)\s*(?:剩余|还剩)\s*(\d+)\s*个?",
             r"(?:今日|今天)?\s*(?:剩余|还剩)\s*(\d+)\s*个?(?:视频生成额度|视频额度|生成额度)",
             r"(?:视频生成额度|视频额度|生成额度)\s*(?:剩余|还剩)\s*(\d+)\s*个?",
         ]
@@ -751,7 +753,9 @@ class DoubaoAccountManager:
         accounts = [
             a
             for a in self.store.list_accounts()
-            if a.get("enabled") and self.store.has_quota(a, quota_kind, quota_units)
+            if a.get("enabled")
+            and str(a.get("status") or "").lower() not in {"not_logged_in", "captcha_required", "error", "disabled"}
+            and self.store.has_quota(a, quota_kind, quota_units)
         ]
         if not accounts:
             raise RuntimeError(f"No enabled Doubao accounts with available {quota_kind or 'general'} quota")
