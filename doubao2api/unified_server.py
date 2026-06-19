@@ -389,18 +389,23 @@ def create_app(
 
     # ── Auth helper ──
 
+    def _effective_api_key() -> str:
+        value = accounts.store.get_setting("api_key", "").strip()
+        return value or (api_key or "").strip()
+
     def _check_auth(request: Request) -> None:
-        if not api_key:
+        active_api_key = _effective_api_key()
+        if not active_api_key:
             return
         auth = request.headers.get("Authorization", "")
         token = auth[7:].strip() if auth.startswith("Bearer ") else auth.strip()
         if not token:
             token = request.query_params.get("key", "").strip()
-        if api_key == "any":
+        if active_api_key == "any":
             if not token:
                 raise HTTPException(status_code=401, detail="API key required")
             return
-        if token != api_key:
+        if token != active_api_key:
             raise HTTPException(status_code=401, detail="Invalid API key")
 
     async def _get_account_client(
@@ -2313,6 +2318,36 @@ def create_app(
                 "audio": ["doubao-music"],
             },
         })
+
+    @app.get("/admin/api/service/api-key")
+    async def admin_service_api_key(request: Request):
+        _check_auth(request)
+        return JSONResponse({
+            "provider": "DOUBAO-WEB-01",
+            "api_key": _effective_api_key(),
+            "api_base_path": "/v1",
+            "header": "Authorization: Bearer",
+        })
+
+    @app.put("/admin/api/service/api-key")
+    async def admin_update_service_api_key(request: Request):
+        _check_auth(request)
+        body = await _json_or_empty(request)
+        new_key = str(body.get("api_key") or "").strip()
+        if not new_key:
+            raise HTTPException(status_code=400, detail="api_key is required")
+        accounts.store.set_setting("api_key", new_key)
+        return JSONResponse({
+            "ok": True,
+            "provider": "DOUBAO-WEB-01",
+            "api_key": _effective_api_key(),
+            "api_base_path": "/v1",
+            "header": "Authorization: Bearer",
+        })
+
+    @app.post("/admin/api/service/api-key")
+    async def admin_post_service_api_key(request: Request):
+        return await admin_update_service_api_key(request)
 
     @app.get("/admin/api/logs")
     async def admin_logs(request: Request):

@@ -474,22 +474,27 @@ pre.out{max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-wor
       <section v-show="tab==='system'" class="tab-panel">
         <div class="grid two">
           <div class="card">
-            <h2 style="margin-bottom:12px">运行信息</h2>
-            <div class="kv"><span>监听地址</span><span class="mono">{{system.host}}:{{system.port}}</span></div>
+            <h2 style="margin-bottom:12px">Runtime</h2>
+            <div class="kv"><span>Service</span><span>DOUBAO-WEB-01</span></div>
+            <div class="kv"><span>API Base</span><span class="mono">{{apiBase}}</span></div>
+            <div class="kv"><span>Listen</span><span class="mono">{{system.host}}:{{system.port}}</span></div>
             <div class="kv"><span>RPM Limit</span><span>{{system.rpm_limit}}</span></div>
-            <div class="kv"><span>Python</span><span class="mono">{{system.python_version}}</span></div>
-            <div class="kv"><span>平台</span><span class="mono">{{system.platform}}</span></div>
-            <div class="kv"><span>账号数据库</span><span class="mono">{{system.account_db}}</span></div>
-            <div class="kv"><span>数据目录</span><span class="mono">{{system.account_data_root}}</span></div>
+            <div class="kv"><span>Account DB</span><span class="mono">{{system.account_db}}</span></div>
+            <div class="kv"><span>Data Dir</span><span class="mono">{{system.account_data_root}}</span></div>
           </div>
           <div class="card">
-            <h2 style="margin-bottom:12px">模型</h2>
-            <div class="badges">
-              <span v-for="m in allModels" :key="m" class="badge hot">{{m}}</span>
-            </div>
+            <h2 style="margin-bottom:12px">API Key Manager</h2>
+            <label>API Key<input v-model="serviceKey.api_key" class="mono" autocomplete="off"></label>
+            <div class="actions" style="margin-top:14px"><button class="btn" @click="copy(apiBase)">Copy API Base</button><button class="btn" @click="copy(serviceKey.api_key)">Copy API Key</button><button class="btn primary" @click="saveServiceKey">Save API Key</button></div>
+            <p class="hint" style="margin-top:12px">This key is used by NewAPI channels. Saving takes effect immediately and persists to SQLite; the environment variable is only the initial fallback.</p>
+            <span v-if="serviceKey.message" class="badge ready" style="margin-top:10px">{{serviceKey.message}}</span>
+          </div>
+          <div class="card">
+            <h2 style="margin-bottom:12px">Models</h2>
+            <div class="badges"><span v-for="m in allModels" :key="m" class="badge hot">{{m}}</span></div>
             <h2 style="margin:18px 0 12px">noVNC</h2>
             <iframe v-if="showVnc" :src="novncUrl" style="width:100%;height:430px;border:1px solid var(--line);border-radius:var(--radius-md)"></iframe>
-            <button v-else class="btn" @click="showVnc=true">打开 noVNC</button>
+            <button v-else class="btn" @click="showVnc=true">Open noVNC</button>
           </div>
         </div>
       </section>
@@ -553,6 +558,7 @@ createApp({
     const selectedId=ref("");
     const defaultAccountId=ref("default");
     const system=reactive({});
+    const serviceKey=reactive({api_key:"",message:""});
     const logs=ref([]);
     const addModal=ref(false);
     const newAccount=reactive({name:"",id:""});
@@ -569,6 +575,7 @@ createApp({
     const readyCount=computed(()=>accounts.value.filter(a=>a.runtime?.ready).length);
     const hotCount=computed(()=>accounts.value.filter(a=>a.runtime?.hot).length);
     const novncUrl=NOVNC_URL;
+    const apiBase=computed(()=>API+"/v1");
 
     function authHeaders(json=true){
       const h={};
@@ -603,8 +610,18 @@ createApp({
     async function loadLogs(){
       try{logs.value=(await api("/admin/api/logs")).reverse()}catch(e){console.warn(e)}
     }
+    async function loadServiceKey(){
+      const data=await api("/admin/api/service/api-key");
+      serviceKey.api_key=data.api_key||"";
+    }
+    async function saveServiceKey(){
+      const data=await api("/admin/api/service/api-key",{method:"PUT",body:JSON.stringify({api_key:serviceKey.api_key})});
+      serviceKey.api_key=data.api_key||serviceKey.api_key;
+      serviceKey.message="Saved and active";
+      setTimeout(()=>serviceKey.message="",2400);
+    }
     async function refreshAll(){
-      await Promise.all([loadSystem(),loadAccounts(),loadLogs()]);
+      await Promise.all([loadSystem(),loadAccounts(),loadLogs(),loadServiceKey()]);
       if(selectedId.value)loadCookies(selectedId.value);
     }
     function selectAccount(id){selectedId.value=id;loadCookies(id)}
@@ -774,7 +791,7 @@ createApp({
       setInterval(()=>{if(tab.value==="logs")loadLogs()},5000);
       setInterval(()=>{loadAccounts()},15000);
     });
-    return{tabs,tab,title,busy,accounts,selectedId,selectedAccount,defaultAccountId,system,logs,addModal,newAccount,cookieData,screenshot,probeState,qr,showVnc,test,allModels,readyCount,hotCount,novncUrl,quotaForm,refreshAll,loadAccounts,selectAccount,openAdd,createAccount,deleteAccount,saveQuota,syncQuota,startAccount,stopAccount,restartAccount,probe,loadCookies,takeScreenshot,startQr,closeQr,runTest,copy,statusText,quota,providerQuota,providerCredit,quotaLimit,quotaRemaining,fmtTime,fmtClock};
+    return{tabs,tab,title,busy,accounts,selectedId,selectedAccount,defaultAccountId,system,serviceKey,apiBase,logs,addModal,newAccount,cookieData,screenshot,probeState,qr,showVnc,test,allModels,readyCount,hotCount,novncUrl,quotaForm,refreshAll,loadAccounts,selectAccount,openAdd,createAccount,deleteAccount,saveQuota,syncQuota,startAccount,stopAccount,restartAccount,probe,loadCookies,takeScreenshot,startQr,closeQr,runTest,copy,statusText,quota,providerQuota,providerCredit,quotaLimit,quotaRemaining,fmtTime,fmtClock,saveServiceKey};
   }
 }).mount("#app");
 </script>

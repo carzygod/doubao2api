@@ -162,6 +162,32 @@ class DoubaoAccountStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_doubao_account_usage_window ON doubao_account_usage(account_id, kind, status, created_at)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS doubao_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+
+    def get_setting(self, key: str, default: str = "") -> str:
+        with self._lock, self._connection() as conn:
+            row = conn.execute("SELECT value FROM doubao_settings WHERE key = ?", (key,)).fetchone()
+            return str(row["value"]) if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        now = _now()
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO doubao_settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (key, value, now),
+            )
 
     def ensure_default_account(self) -> Dict[str, Any]:
         existing = self.get("default")
