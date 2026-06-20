@@ -68,6 +68,7 @@ class VideoTaskStore:
                     ratio TEXT,
                     duration INTEGER,
                     ref_image_key TEXT,
+                    reference_image_keys TEXT,
                     request_json TEXT,
                     result_json TEXT,
                     error TEXT,
@@ -84,6 +85,8 @@ class VideoTaskStore:
             cols = {row["name"] for row in conn.execute("PRAGMA table_info(video_tasks)").fetchall()}
             if "account_id" not in cols:
                 conn.execute("ALTER TABLE video_tasks ADD COLUMN account_id TEXT")
+            if "reference_image_keys" not in cols:
+                conn.execute("ALTER TABLE video_tasks ADD COLUMN reference_image_keys TEXT")
 
     def mark_interrupted(self) -> None:
         now = int(time.time())
@@ -115,8 +118,8 @@ class VideoTaskStore:
                 """
                 INSERT INTO video_tasks (
                     task_id, created, updated, status, prompt, model, provider_model,
-                    account_id, ratio, duration, ref_image_key, request_json
-                ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
+                    account_id, ratio, duration, ref_image_key, reference_image_keys, request_json
+                ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -129,6 +132,7 @@ class VideoTaskStore:
                     params.get("ratio"),
                     params.get("duration"),
                     params.get("ref_image_key"),
+                    json.dumps(params.get("reference_image_keys") or [], ensure_ascii=False),
                     json.dumps(request_body, ensure_ascii=False),
                 ),
             )

@@ -1527,6 +1527,7 @@ class DoubaoChatClient:
         ratio: Optional[str] = None,
         camera_movement: Optional[str] = None,
         ref_image_key: Optional[str] = None,
+        reference_image_keys: Optional[List[str]] = None,
         timeout: float = 300,
     ) -> "VideoGenerationResult":
         """Generate video using Doubao's AI video generation.
@@ -1542,6 +1543,7 @@ class DoubaoChatClient:
             ratio: Aspect ratio (e.g. "16:9", "9:16", "1:1").
             camera_movement: Camera movement style (optional).
             ref_image_key: Optional image key (from upload_image) for img2video.
+            reference_image_keys: Optional list of uploaded image keys for multi-image reference.
             timeout: Max seconds to wait for video generation (default 300).
 
         Returns:
@@ -1552,6 +1554,19 @@ class DoubaoChatClient:
             content_dict["ratio"] = ratio
         if camera_movement:
             content_dict["camera_movement"] = camera_movement
+        image_keys = []
+        if ref_image_key:
+            image_keys.append(str(ref_image_key))
+        for key in reference_image_keys or []:
+            if key:
+                image_keys.append(str(key))
+        image_keys = list(dict.fromkeys(image_keys))
+        if image_keys:
+            content_dict["ref_image_key"] = image_keys[0]
+            if len(image_keys) > 1:
+                content_dict["ref_image_keys"] = image_keys
+                content_dict["reference_image_keys"] = image_keys
+                content_dict["reference_images"] = [{"key": key, "type": "image"} for key in image_keys]
 
         message: Dict[str, Any] = {
             "content": json.dumps(content_dict, ensure_ascii=False),
@@ -1566,9 +1581,10 @@ class DoubaoChatClient:
             },
         }
 
-        if ref_image_key:
+        if image_keys:
             message["attachments"] = [
-                {"type": "image", "key": ref_image_key}
+                {"type": "image", "key": key, "extra": {"refer_types": "overall"}}
+                for key in image_keys
             ]
 
         sent_event: Dict[str, Any] = {

@@ -27,11 +27,13 @@ class VideoTaskStoreTest(unittest.TestCase):
                     "ratio": "16:9",
                     "duration": 10,
                     "ref_image_key": None,
+                    "reference_image_keys": ["tos-a", "tos-b"],
                 },
                 {"prompt": "white cube", "duration": 10},
             )
 
             self.assertEqual(task["status"], "queued")
+            self.assertEqual(json.loads(task["reference_image_keys"]), ["tos-a", "tos-b"])
             self.assertEqual(store.counts(), {"queued": 1})
 
             result = {"data": [{"video_url": "https://example.com/video.mp4"}]}

@@ -36,6 +36,7 @@ from .account_manager import DoubaoAccountManager, account_data_root
 from .browser_client import BrowserClient
 from .qianwen_client import QianwenClient, QIANWEN_MODELS
 from .video_tasks import VideoTaskStore, video_task_db_path
+from .video_request import collect_video_reference_values, extract_video_prompt
 from .tool_calling import (
     build_tool_system_prompt,
     convert_messages_with_tools,
@@ -541,7 +542,7 @@ def create_app(
         return duration
 
     def _parse_video_request(body: Dict[str, Any]) -> Dict[str, Any]:
-        prompt = str(body.get("prompt") or body.get("input") or "").strip()
+        prompt = extract_video_prompt(body)
         if not prompt:
             raise HTTPException(status_code=400, detail="Missing prompt")
 
@@ -563,6 +564,8 @@ def create_app(
         duration = _normalize_video_duration(
             body.get("duration", body.get("duration_seconds", body.get("seconds")))
         )
+        reference_images = collect_video_reference_values(body)
+        ref_image_key = reference_images[0] if reference_images else None
 
         return {
             "prompt": prompt,
@@ -570,7 +573,9 @@ def create_app(
             "provider_model": requested_model,
             "ratio": ratio,
             "duration": duration,
-            "ref_image_key": body.get("ref_image_key") or body.get("image_key") or body.get("file_id"),
+            "ref_image_key": ref_image_key,
+            "reference_images": reference_images,
+            "reference_image_keys": [],
             "image_url": body.get("image_url"),
             "image": body.get("image"),
             "account_id": str(body.get("account_id") or body.get("doubao_account_id") or body.get("account") or "").strip() or None,
@@ -644,26 +649,23 @@ def create_app(
         accounts.record_task_failure(account["id"], message)
         return retry_next
 
-    async def _materialize_video_ref_image_key(
+    async def _materialize_video_image_reference(
         client: BrowserClient,
-        params: Dict[str, Any],
+        image_value: Any,
+        index: int = 0,
     ) -> Optional[str]:
-        ref_image_key = params.get("ref_image_key")
-        if ref_image_key:
-            return str(ref_image_key)
-
-        image_value = str(params.get("image") or params.get("image_url") or "").strip()
+        image_value = str(image_value or "").strip()
         if not image_value:
             return None
 
-        filename = "video-start-frame.png"
+        filename = f"video-reference-{index + 1}.png"
         image_bytes: bytes
         if image_value.startswith("data:"):
             try:
                 header, encoded = image_value.split(",", 1)
                 mime_type = header[5:].split(";", 1)[0]
                 ext = mimetypes.guess_extension(mime_type) or ".png"
-                filename = f"video-start-frame{ext}"
+                filename = f"video-reference-{index + 1}{ext}"
                 image_bytes = base64.b64decode(encoded)
             except (ValueError, TypeError, binascii.Error) as exc:
                 raise HTTPException(status_code=400, detail="Invalid image data URI") from exc
@@ -681,6 +683,24 @@ def create_app(
 
         uploaded = await client.upload_image(image_bytes=image_bytes, filename=filename)
         return uploaded.get("uri") or uploaded.get("cdn_url")
+
+    async def _materialize_video_reference_image_keys(
+        client: BrowserClient,
+        params: Dict[str, Any],
+    ) -> List[str]:
+        refs = list(params.get("reference_images") or [])
+        if not refs and params.get("ref_image_key"):
+            refs = [params["ref_image_key"]]
+
+        keys: List[str] = []
+        seen = set()
+        for index, ref in enumerate(refs):
+            key = await _materialize_video_image_reference(client, ref, index)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            keys.append(str(key))
+        return keys
 
     async def _execute_video_generation_once(params: Dict[str, Any], request: Optional[Request] = None) -> Dict[str, Any]:
         await bucket.acquire()
@@ -705,18 +725,22 @@ def create_app(
                     "provider_model": params.get("provider_model"),
                     "duration": params.get("duration"),
                     "ratio": params.get("ratio"),
+                    "reference_image_count": len(params.get("reference_images") or []),
                 },
             )
             params["quota_reservation_id"] = reservation_id
             params["quota_units"] = quota_units
         try:
-            ref_image_key = await _materialize_video_ref_image_key(client, params)
+            reference_image_keys = await _materialize_video_reference_image_keys(client, params)
+            ref_image_key = reference_image_keys[0] if reference_image_keys else None
             params["ref_image_key"] = ref_image_key
+            params["reference_image_keys"] = reference_image_keys
             try:
                 result = await client.generate_video(
                     prompt=params["prompt"],
                     ratio=params.get("ratio"),
                     ref_image_key=ref_image_key,
+                    reference_image_keys=reference_image_keys,
                     model=params.get("provider_model"),
                     duration=params.get("duration"),
                 )
@@ -732,6 +756,7 @@ def create_app(
                     prompt=params["prompt"],
                     ratio=params.get("ratio"),
                     ref_image_key=ref_image_key,
+                    reference_image_keys=reference_image_keys,
                     model=params.get("provider_model"),
                     duration=params.get("duration"),
                 )
@@ -774,6 +799,8 @@ def create_app(
             "account_id": account["id"],
             "quota": accounts.store.quota_snapshot(refreshed_account, "video"),
         }
+        if params.get("reference_image_keys"):
+            response["reference_image_keys"] = params["reference_image_keys"]
         if msg:
             response["message"] = msg
         return response
@@ -884,6 +911,15 @@ def create_app(
                 response["seconds"] = str(task["duration"])
         if openai and task.get("ratio"):
             response["size"] = str(task["ratio"])
+        if task.get("ref_image_key"):
+            response["ref_image_key"] = task["ref_image_key"]
+        if task.get("reference_image_keys"):
+            try:
+                reference_image_keys = json.loads(task["reference_image_keys"])
+            except (TypeError, json.JSONDecodeError):
+                reference_image_keys = []
+            if reference_image_keys:
+                response["reference_image_keys"] = reference_image_keys
         if task.get("message") and not (status == "completed" and task.get("result_json")):
             response["message"] = task["message"]
         if task.get("error"):
@@ -1693,6 +1729,7 @@ def create_app(
                 "duration": params.get("duration"),
                 "ratio": params.get("ratio"),
                 "async": True,
+                "reference_image_count": len(params.get("reference_images") or []),
             },
         )
         try:

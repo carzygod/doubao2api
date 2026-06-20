@@ -250,3 +250,24 @@ curl http://127.0.0.1:19090/v1/videos \
     "ratio": "16:9"
   }'
 ```
+### Multi-Image Reference Video Notes
+
+The video API accepts uploaded Doubao image keys, HTTP(S) image URLs, or `data:image/...;base64,...` data URIs. The server uploads URL/data-URI references to Doubao first, then forwards every resolved key to the web video ability.
+
+Supported request fields include `ref_image_key`, `ref_image_keys`, `reference_image_keys`, `image_url`, `image_urls`, `images`, `reference_images`, `first_frame_image`, and `last_frame_image`.
+
+```bash
+curl http://127.0.0.1:19090/v1/videos \
+  -H "Authorization: Bearer change-me-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "doubao-video",
+    "prompt": "use the two reference frames to create a 5 second transition video",
+    "duration": 5,
+    "ratio": "16:9",
+    "reference_images": [
+      {"url": "https://example.com/frame-1.png"},
+      {"url": "https://example.com/frame-2.png"}
+    ]
+  }'
+```

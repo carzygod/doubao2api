@@ -1391,11 +1391,32 @@ class BrowserClient:
         log.info("generate_music: got %d tracks", len(tracks))
         return {"tracks": tracks, "prompt": prompt}
 
+    @staticmethod
+    def _normalize_reference_image_keys(
+        ref_image_key: Optional[str],
+        reference_image_keys: Optional[List[str]],
+    ) -> List[str]:
+        keys: List[str] = []
+        if ref_image_key:
+            keys.append(str(ref_image_key))
+        for key in reference_image_keys or []:
+            if key:
+                keys.append(str(key))
+        seen = set()
+        result: List[str] = []
+        for key in keys:
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(key)
+        return result
+
     async def generate_video_web(
         self,
         prompt: str,
         ratio: Optional[str] = None,
         ref_image_key: Optional[str] = None,
+        reference_image_keys: Optional[List[str]] = None,
         model: Optional[str] = None,
         duration: Optional[int] = None,
     ) -> Dict[str, Any]:
@@ -1403,14 +1424,19 @@ class BrowserClient:
         import base64
         import re
 
+        image_keys = self._normalize_reference_image_keys(ref_image_key, reference_image_keys)
+
         ability_param: Dict[str, Any] = {
             "model": model or os.environ.get("DOUBAO_VIDEO_MODEL", "seedance_v2.0"),
             "duration": int(duration or os.environ.get("DOUBAO_VIDEO_DURATION", "10")),
         }
         if ratio:
             ability_param["ratio"] = ratio
-        if ref_image_key:
-            ability_param["ref_image_key"] = ref_image_key
+        if image_keys:
+            ability_param["ref_image_key"] = image_keys[0]
+            if len(image_keys) > 1:
+                ability_param["ref_image_keys"] = image_keys
+                ability_param["reference_image_keys"] = image_keys
 
         chat_ability = {
             "ability_type": 17,
@@ -1654,6 +1680,7 @@ class BrowserClient:
         prompt: str,
         ratio: Optional[str] = None,
         ref_image_key: Optional[str] = None,
+        reference_image_keys: Optional[List[str]] = None,
         model: Optional[str] = None,
         duration: Optional[int] = None,
     ) -> Dict[str, Any]:
@@ -1663,17 +1690,24 @@ class BrowserClient:
             prompt: Text description of the video to generate.
             ratio: Aspect ratio ("16:9", "9:16", "1:1").
             ref_image_key: Optional uploaded image key to use as the first/reference frame.
+            reference_image_keys: Optional list of uploaded image keys for multi-image reference.
 
         Returns:
             Dict with 'videos' list, each having video_url/cover_url/duration.
         """
         import base64
 
+        image_keys = self._normalize_reference_image_keys(ref_image_key, reference_image_keys)
+
         content_data: Dict[str, Any] = {"text": prompt}
         if ratio:
             content_data["ratio"] = ratio
-        if ref_image_key:
-            content_data["ref_image_key"] = ref_image_key
+        if image_keys:
+            content_data["ref_image_key"] = image_keys[0]
+            if len(image_keys) > 1:
+                content_data["ref_image_keys"] = image_keys
+                content_data["reference_image_keys"] = image_keys
+                content_data["reference_images"] = [{"key": key, "type": "image"} for key in image_keys]
         if model:
             content_data["model"] = model
         if duration:
@@ -1692,9 +1726,10 @@ class BrowserClient:
             },
         }
 
-        if ref_image_key:
+        if image_keys:
             message["attachments"] = [
-                {"type": "image", "key": ref_image_key, "extra": {"refer_types": "overall"}}
+                {"type": "image", "key": key, "extra": {"refer_types": "overall"}}
+                for key in image_keys
             ]
 
         payload = {
