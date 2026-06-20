@@ -437,6 +437,55 @@ def create_app(
     def _looks_quota_error(message: str) -> bool:
         return is_quota_exhaustion_message(message)
 
+    def _looks_account_state_error(message: str) -> bool:
+        text = (message or "").lower()
+        if not text:
+            return False
+        business_markers = (
+            "no images generated",
+            "no videos generated",
+            "no music tracks generated",
+            "please upload",
+            "请上传",
+            "服务过载",
+            "service overloaded",
+            "生成失败",
+            "invalid image data",
+            "missing prompt",
+        )
+        if any(marker in text for marker in business_markers):
+            return False
+        account_markers = (
+            "not logged in",
+            "login",
+            "未登录",
+            "cookie",
+            "session expired",
+            "invalid session",
+            "auth error",
+            "unauthorized",
+            "forbidden",
+            "captcha",
+            "验证码",
+            "risk",
+            "风控",
+            "temporarily blocked",
+            "browser not ready",
+            "browser not available",
+            "page crashed",
+            "context closed",
+            "target closed",
+            "401",
+            "403",
+        )
+        return any(marker in text for marker in account_markers)
+
+    def _record_provider_failure(account_id: str, message: str) -> None:
+        if _looks_account_state_error(message):
+            accounts.mark_failure(account_id, message)
+        else:
+            accounts.record_task_failure(account_id, message)
+
     class _VideoAttemptFailed(RuntimeError):
         def __init__(self, account_id: str, message: str, retry_next_account: bool = False):
             super().__init__(message)
@@ -581,7 +630,7 @@ def create_app(
                 retry_next = int(provider_remaining) < max(1, int(quota_units))
             except (TypeError, ValueError):
                 retry_next = False
-            accounts.mark_failure(account["id"], message)
+            accounts.record_task_failure(account["id"], message)
             return retry_next
         if _looks_quota_error(message):
             _zero_video_quota(account["id"], "quota_error", message)
@@ -591,7 +640,8 @@ def create_app(
             if not probe_ok:
                 _zero_video_quota(account["id"], "probe_failed_after_video_error", message)
                 retry_next = True
-        accounts.mark_failure(account["id"], message)
+                return retry_next
+        accounts.record_task_failure(account["id"], message)
         return retry_next
 
     async def _materialize_video_ref_image_key(
@@ -1148,7 +1198,7 @@ def create_app(
                 )
                 finish_reason = "stop"
         except RuntimeError as exc:
-            accounts.mark_failure(account["id"], str(exc))
+            _record_provider_failure(account["id"], str(exc))
             raise HTTPException(status_code=502, detail=str(exc))
 
         # max_tokens truncation (non-streaming only)
@@ -1530,7 +1580,7 @@ def create_app(
             accounts.release_quota(reservation_id)
             if _looks_quota_error(str(exc)):
                 accounts.mark_quota_exhausted(account["id"], "image", str(exc))
-            accounts.mark_failure(account["id"], str(exc))
+            _record_provider_failure(account["id"], str(exc))
             raise HTTPException(status_code=502, detail=str(exc))
         except Exception:
             accounts.release_quota(reservation_id)
@@ -1539,6 +1589,7 @@ def create_app(
         images = result.get("images", [])
         if not images:
             accounts.release_quota(reservation_id)
+            accounts.record_task_failure(account["id"], "No images generated")
             raise HTTPException(
                 status_code=502, detail="No images generated"
             )
@@ -1579,11 +1630,12 @@ def create_app(
                 genre=body.get("genre"),
             )
         except RuntimeError as exc:
-            accounts.mark_failure(account["id"], str(exc))
+            _record_provider_failure(account["id"], str(exc))
             raise HTTPException(status_code=502, detail=str(exc))
 
         tracks = result.get("tracks", [])
         if not tracks:
+            accounts.record_task_failure(account["id"], "No music tracks generated")
             raise HTTPException(
                 status_code=502, detail="No music tracks generated"
             )
@@ -1697,7 +1749,7 @@ def create_app(
         try:
             result = await client.upload_file(file_data, filename)
         except RuntimeError as exc:
-            accounts.mark_failure(account["id"], str(exc))
+            _record_provider_failure(account["id"], str(exc))
             raise HTTPException(status_code=502, detail=str(exc))
 
         accounts.mark_success(account["id"])
@@ -1720,7 +1772,7 @@ def create_app(
         try:
             url = await client.get_file_download_url(uri=uri, expire_seconds=expire)
         except RuntimeError as exc:
-            accounts.mark_failure(account["id"], str(exc))
+            _record_provider_failure(account["id"], str(exc))
             raise HTTPException(status_code=502, detail=str(exc))
         accounts.mark_success(account["id"])
         return JSONResponse({"url": url, "uri": uri, "expires_in": expire})
@@ -1739,7 +1791,7 @@ def create_app(
         try:
             result = await client.upload_image(image_bytes=image_data, filename=filename)
         except RuntimeError as exc:
-            accounts.mark_failure(account["id"], str(exc))
+            _record_provider_failure(account["id"], str(exc))
             raise HTTPException(status_code=502, detail=str(exc))
         accounts.mark_success(account["id"])
         return JSONResponse({
@@ -1780,7 +1832,7 @@ def create_app(
                 use_deep_think=use_deep_think,
             )
         except RuntimeError as exc:
-            accounts.mark_failure(account["id"], str(exc))
+            _record_provider_failure(account["id"], str(exc))
             raise HTTPException(status_code=502, detail=str(exc))
 
         accounts.mark_success(account["id"])
@@ -2393,7 +2445,7 @@ def create_app(
             try:
                 await accounts.ensure_client(account["id"])
             except Exception as exc:
-                accounts.store.mark_failure(account["id"], str(exc), "error")
+                accounts.store.mark_failure(account["id"], str(exc), "browser_error")
         return JSONResponse(account)
 
     @app.patch("/admin/api/accounts/{account_id}")

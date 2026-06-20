@@ -11,9 +11,24 @@ account_manager = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(account_manager)
 DoubaoAccountStore = account_manager.DoubaoAccountStore
+UNAVAILABLE_ACCOUNT_STATUSES = account_manager.UNAVAILABLE_ACCOUNT_STATUSES
 
 
 class AccountQuotaTest(unittest.TestCase):
+    def test_task_failure_does_not_make_ready_account_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DoubaoAccountStore(str(Path(tmp) / "accounts.sqlite3"))
+            store.ensure_default_account()
+            store.update_account("default", status="ready", last_error="")
+
+            store.record_task_failure("default", "single video task failed", keep_ready=True)
+            account = store.get("default")
+
+            self.assertEqual(account["status"], "ready")
+            self.assertEqual(account["last_error"], "single video task failed")
+            self.assertNotIn("error", UNAVAILABLE_ACCOUNT_STATUSES)
+            self.assertIn("browser_error", UNAVAILABLE_ACCOUNT_STATUSES)
+
     def test_reserve_release_and_complete_quota(self):
         with tempfile.TemporaryDirectory() as tmp:
             old_image = os.environ.get("DOUBAO_IMAGE_24H_QUOTA")

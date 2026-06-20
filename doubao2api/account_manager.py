@@ -26,7 +26,17 @@ ACCOUNT_STATUSES = {
     "not_logged_in",
     "captcha_required",
     "error",
+    "browser_error",
+    "temporarily_blocked",
     "stopped",
+    "disabled",
+}
+
+UNAVAILABLE_ACCOUNT_STATUSES = {
+    "not_logged_in",
+    "captcha_required",
+    "browser_error",
+    "temporarily_blocked",
     "disabled",
 }
 
@@ -323,6 +333,19 @@ class DoubaoAccountStore:
             last_error=message[:500],
             last_validated_at=_now(),
         )
+
+    def record_task_failure(self, account_id: str, message: str, *, keep_ready: bool = False) -> None:
+        account = self.get(account_id)
+        if not account:
+            return
+        fields: Dict[str, Any] = {
+            "last_error": message[:500],
+            "last_validated_at": _now(),
+        }
+        current_status = str(account.get("status") or "").lower()
+        if keep_ready and current_status not in UNAVAILABLE_ACCOUNT_STATUSES:
+            fields["status"] = "ready"
+        self.update_account(account_id, **fields)
 
     def quota_limit(self, account: Dict[str, Any], kind: str) -> int:
         quota = account.get("quota") or {}
@@ -778,7 +801,7 @@ class DoubaoAccountManager:
             try:
                 await client.start()
             except Exception as exc:
-                self.store.mark_failure(account_id, str(exc), "error")
+                self.store.mark_failure(account_id, str(exc), "browser_error")
                 try:
                     await client.stop()
                 except Exception:
@@ -819,7 +842,7 @@ class DoubaoAccountManager:
             a
             for a in self.store.list_accounts()
             if a.get("enabled")
-            and str(a.get("status") or "").lower() not in {"not_logged_in", "captcha_required", "error", "disabled"}
+            and str(a.get("status") or "").lower() not in UNAVAILABLE_ACCOUNT_STATUSES
             and self.store.has_quota(a, quota_kind, quota_units)
         ]
         if not accounts:
@@ -914,12 +937,23 @@ class DoubaoAccountManager:
 
     def mark_failure(self, account_id: str, message: str, error_code: int = 0) -> None:
         client = self.clients.get(account_id)
-        status = "error"
+        status = "browser_error"
         if client:
             client.record_failure(error_code)
             if client.needs_captcha:
                 status = "captcha_required"
         self.store.mark_failure(account_id, message, status)
+
+    def record_task_failure(self, account_id: str, message: str) -> None:
+        client = self.clients.get(account_id)
+        if client and client.needs_captcha:
+            self.store.mark_failure(account_id, message, "captcha_required")
+            return
+        self.store.record_task_failure(
+            account_id,
+            message,
+            keep_ready=bool(client and client.is_ready),
+        )
 
     def reserve_quota(
         self,
