@@ -46,7 +46,11 @@ _REQUEST_IMAGE_KEYS = (
     "last_frame_url",
     *_COLLECTION_IMAGE_KEYS,
     "references",
+    "content",
+    "metadata",
 )
+
+_NESTED_IMAGE_KEYS = ("content", "input")
 
 
 def extract_video_prompt(body: Dict[str, Any]) -> str:
@@ -55,24 +59,36 @@ def extract_video_prompt(body: Dict[str, Any]) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
 
-    value = body.get("input")
+    for key in ("input", "content"):
+        prompt = _extract_prompt_from_value(body.get(key))
+        if prompt:
+            return prompt
+
+    metadata = body.get("metadata")
+    if isinstance(metadata, dict):
+        prompt = _extract_prompt_from_value(metadata.get("content") or metadata.get("input"))
+        if prompt:
+            return prompt
+    return ""
+
+
+def _extract_prompt_from_value(value: Any) -> str:
     if isinstance(value, str):
         return value.strip()
+    if isinstance(value, dict):
+        if value.get("type") in _TEXT_TYPES and isinstance(value.get("text"), str):
+            return value["text"].strip()
+        for key in ("text", "prompt", "content"):
+            text = value.get(key)
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+        return ""
     if isinstance(value, list):
         parts: List[str] = []
         for item in value:
-            if isinstance(item, str):
-                if item.strip():
-                    parts.append(item.strip())
-                continue
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") in _TEXT_TYPES and isinstance(item.get("text"), str):
-                if item["text"].strip():
-                    parts.append(item["text"].strip())
-            elif isinstance(item.get("content"), str):
-                if item["content"].strip():
-                    parts.append(item["content"].strip())
+            text = _extract_prompt_from_value(item)
+            if text:
+                parts.append(text)
         return "\n".join(parts).strip()
     return ""
 
@@ -120,6 +136,10 @@ def _append_image_refs(refs: List[str], value: Any) -> None:
         _append_image_refs(refs, value.get(key))
     for key in _COLLECTION_IMAGE_KEYS:
         _append_image_refs(refs, value.get(key))
+    for key in _NESTED_IMAGE_KEYS:
+        nested = value.get(key)
+        if not isinstance(nested, str):
+            _append_image_refs(refs, nested)
 
 
 def _dedupe(values: List[str]) -> List[str]:

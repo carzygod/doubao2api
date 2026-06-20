@@ -1411,6 +1411,46 @@ class BrowserClient:
             result.append(key)
         return result
 
+    @staticmethod
+    def _build_video_message(
+        prompt: str,
+        ratio: Optional[str],
+        image_keys: List[str],
+        model: Optional[str],
+        duration: Optional[int],
+    ) -> Dict[str, Any]:
+        content_data: Dict[str, Any] = {"text": prompt}
+        if ratio:
+            content_data["ratio"] = ratio
+        if image_keys:
+            content_data["ref_image_key"] = image_keys[0]
+            content_data["ref_image_keys"] = image_keys
+            content_data["reference_image_keys"] = image_keys
+            content_data["reference_images"] = [{"key": key, "type": "image"} for key in image_keys]
+        if model:
+            content_data["model"] = model
+        if duration:
+            content_data["duration"] = int(duration)
+
+        message: Dict[str, Any] = {
+            "content": json.dumps(content_data, ensure_ascii=False),
+            "content_type": 2020,
+            "attachments": [],
+            "references": [],
+            "skill": {
+                "skill_type": 17,
+                "skill_type_no_default": 17,
+                "skill_id": "17",
+                "skill_id_no_default": "17",
+            },
+        }
+        if image_keys:
+            message["attachments"] = [
+                {"type": "image", "key": key, "extra": {"refer_types": "overall"}}
+                for key in image_keys
+            ]
+        return message
+
     async def generate_video_web(
         self,
         prompt: str,
@@ -1699,38 +1739,7 @@ class BrowserClient:
 
         image_keys = self._normalize_reference_image_keys(ref_image_key, reference_image_keys)
 
-        content_data: Dict[str, Any] = {"text": prompt}
-        if ratio:
-            content_data["ratio"] = ratio
-        if image_keys:
-            content_data["ref_image_key"] = image_keys[0]
-            if len(image_keys) > 1:
-                content_data["ref_image_keys"] = image_keys
-                content_data["reference_image_keys"] = image_keys
-                content_data["reference_images"] = [{"key": key, "type": "image"} for key in image_keys]
-        if model:
-            content_data["model"] = model
-        if duration:
-            content_data["duration"] = int(duration)
-
-        message: Dict[str, Any] = {
-            "content": json.dumps(content_data, ensure_ascii=False),
-            "content_type": 2020,
-            "attachments": [],
-            "references": [],
-            "skill": {
-                "skill_type": 17,
-                "skill_type_no_default": 17,
-                "skill_id": "17",
-                "skill_id_no_default": "17",
-            },
-        }
-
-        if image_keys:
-            message["attachments"] = [
-                {"type": "image", "key": key, "extra": {"refer_types": "overall"}}
-                for key in image_keys
-            ]
+        message = self._build_video_message(prompt, ratio, image_keys, model, duration)
 
         payload = {
             "messages": [message],

@@ -951,6 +951,50 @@ def create_app(
                             response["metadata"] = {"url": first_url}
         return response
 
+    def _format_doubao_official_task(task: Dict[str, Any]) -> Dict[str, Any]:
+        status_map = {
+            "queued": "pending",
+            "in_progress": "processing",
+            "running": "processing",
+            "completed": "succeeded",
+            "failed": "failed",
+            "cancelled": "failed",
+            "canceled": "failed",
+        }
+        status = status_map.get(str(task["status"]), "processing")
+        response: Dict[str, Any] = {
+            "id": task["task_id"],
+            "model": task.get("model") or "doubao-video",
+            "status": status,
+            "content": {"video_url": ""},
+            "created_at": task["created"],
+            "updated_at": task["updated"],
+        }
+        if task.get("ratio"):
+            response["ratio"] = task["ratio"]
+        if task.get("duration"):
+            response["duration"] = int(task["duration"])
+        if task.get("error"):
+            response["error"] = {
+                "code": "video_generation_failed",
+                "message": task["error"],
+            }
+        if task.get("result_json"):
+            try:
+                result = json.loads(task["result_json"])
+            except json.JSONDecodeError:
+                result = {}
+            if isinstance(result, dict):
+                data = result.get("data")
+                if data and isinstance(data, list) and isinstance(data[0], dict):
+                    response["content"]["video_url"] = data[0].get("video_url") or data[0].get("url") or ""
+                if result.get("message") and status != "succeeded":
+                    response["error"] = {
+                        "code": "video_generation_failed",
+                        "message": result.get("message"),
+                    }
+        return response
+
     async def _run_video_task(task_id: str, params: Dict[str, Any]) -> None:
         existing = video_tasks.get(task_id)
         if existing and existing.get("status") == "cancelled":
@@ -1767,6 +1811,51 @@ def create_app(
             )
             task = video_tasks.get(task_id) or task
         return JSONResponse(_format_video_task(task, openai=_is_openai_video_request(request)))
+
+    @app.post("/api/v3/contents/generations/tasks")
+    async def doubao_official_video_task_create(request: Request):
+        _check_auth(request)
+        body = await request.json()
+        params = _parse_video_request(body)
+        quota_units = _video_quota_units(params)
+        account, _ = await _get_account_client(
+            request,
+            body,
+            quota_kind="video",
+            quota_units=quota_units,
+        )
+        params["account_id"] = account["id"]
+        task_id = f"video-{uuid.uuid4().hex}"
+        params["quota_units"] = quota_units
+        params["quota_reservation_id"] = accounts.reserve_quota(
+            account["id"],
+            "video",
+            quota_units,
+            request_id=task_id,
+            meta={
+                "model": params.get("model"),
+                "provider_model": params.get("provider_model"),
+                "duration": params.get("duration"),
+                "ratio": params.get("ratio"),
+                "api": "doubao_official_compat",
+                "reference_image_count": len(params.get("reference_images") or []),
+            },
+        )
+        try:
+            task = video_tasks.create(task_id, params, body)
+        except Exception:
+            accounts.release_quota(params["quota_reservation_id"])
+            raise
+        asyncio.create_task(_run_video_task(task_id, params))
+        return JSONResponse({"id": task["task_id"]})
+
+    @app.get("/api/v3/contents/generations/tasks/{task_id}")
+    async def doubao_official_video_task_get(task_id: str, request: Request):
+        _check_auth(request)
+        task = video_tasks.get(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Video task not found")
+        return JSONResponse(_format_doubao_official_task(task))
 
     @app.post("/v1/files")
     async def upload_file(request: Request):

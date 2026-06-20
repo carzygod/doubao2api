@@ -58,6 +58,38 @@ class VideoRequestParsingTest(unittest.TestCase):
             ["https://example.com/a.png", "https://example.com/b.png"],
         )
 
+    def test_newapi_doubao_content_array_supports_text_and_images(self):
+        body = {
+            "model": "doubao-seedance-2-0-fast-260128",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.com/start.png"}},
+                {"type": "image_url", "image_url": {"url": "https://example.com/end.png"}},
+                {"type": "text", "text": "make a transition video"},
+            ],
+            "duration": 5,
+            "ratio": "16:9",
+        }
+
+        self.assertEqual(extract_video_prompt(body), "make a transition video")
+        self.assertEqual(
+            collect_video_reference_values(body),
+            ["https://example.com/start.png", "https://example.com/end.png"],
+        )
+
+    def test_metadata_content_array_supports_newapi_passthrough(self):
+        body = {
+            "prompt": "",
+            "metadata": {
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "https://example.com/ref.png"}},
+                    {"type": "text", "text": "metadata prompt"},
+                ]
+            },
+        }
+
+        self.assertEqual(extract_video_prompt(body), "metadata prompt")
+        self.assertEqual(collect_video_reference_values(body), ["https://example.com/ref.png"])
+
 
 if __name__ == "__main__":
     unittest.main()
