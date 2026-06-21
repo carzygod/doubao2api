@@ -796,7 +796,7 @@ def create_app(
                     "message": str(primary_exc),
                 }
             primary_accepted = is_video_acceptance_message(str(result.get("message") or ""))
-            if not result.get("videos") and not primary_accepted:
+            if not result.get("videos"):
                 fallback = await client.generate_video_web(
                     prompt=params["prompt"],
                     ratio=params.get("ratio"),
@@ -811,6 +811,8 @@ def create_app(
                     result = fallback
                 elif is_video_acceptance_message(str(fallback.get("message") or "")):
                     fallback["message"] = fallback.get("message") or result.get("message", "")
+                    result = fallback
+                elif not primary_accepted:
                     result = fallback
         except HTTPException:
             accounts.release_quota(reservation_id)
@@ -827,25 +829,10 @@ def create_app(
         if not videos:
             message = msg or "No videos generated"
             if is_video_acceptance_message(message):
-                accounts.complete_quota(reservation_id)
-                accounts.update_provider_quota_from_text(
-                    account["id"],
-                    "video",
-                    message,
-                    units_completed=quota_units,
+                message = (
+                    "Provider accepted the video request but did not expose a "
+                    f"retrievable task or video URL after polling. Last provider message: {message}"
                 )
-                accounts.mark_success(account["id"])
-                refreshed_account = accounts.store.get(account["id"]) or account
-                return {
-                    "created": int(time.time()),
-                    "data": [],
-                    "account_id": account["id"],
-                    "quota": accounts.store.quota_snapshot(refreshed_account, "video"),
-                    "message": message,
-                    "pending": True,
-                    "accepted": True,
-                    "reference_image_keys": params.get("reference_image_keys") or [],
-                }
             retry_next = await _handle_video_attempt_failure(account, client, reservation_id, message, quota_units)
             raise _VideoAttemptFailed(account["id"], message, retry_next)
         accounts.complete_quota(reservation_id)
