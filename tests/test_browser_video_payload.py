@@ -134,7 +134,43 @@ class BrowserVideoPayloadTest(unittest.TestCase):
         self.assertEqual(attachment["image"]["uri"], "ocean-cloud-tos/pages_upload_image_a.png")
         self.assertEqual(attachment["image"]["image_ori"]["url"], "https://example.com/a.png")
         self.assertEqual(attachment["image"]["image_ori"]["width"], 320)
+        self.assertEqual(attachment["extra"], {"refer_types": "overall"})
         self.assertEqual(blocks[1]["content"]["text_block"]["text"], "animate this image")
+
+    def test_video_chat_attachment_blocks_match_web_ui_shape(self):
+        blocks = browser_client.BrowserClient._build_chat_attachment_blocks(
+            image_attachments=[{
+                "uri": "tos-cn-i-a9rns2rl98/ref.png",
+                "cdn_url": "",
+                "name": "ref.png",
+                "format": "png",
+                "width": 1254,
+                "height": 1254,
+                "review_state": 1,
+            }],
+            attachment_type=1,
+        )
+
+        attachment = blocks[0]["content"]["attachment_block"]["attachments"][0]
+        self.assertEqual(attachment["type"], 1)
+        self.assertNotIn("extra", attachment)
+        self.assertEqual(attachment["image"]["uri"], "tos-cn-i-a9rns2rl98/ref.png")
+        self.assertEqual(attachment["image"]["image_ori"]["width"], 1254)
+        self.assertEqual(attachment["review_state"], 1)
+
+    def test_image_dimensions_read_png_header(self):
+        png_header = (
+            b"\x89PNG\r\n\x1a\n"
+            b"\x00\x00\x00\rIHDR"
+            b"\x00\x00\x04\xe6"
+            b"\x00\x00\x02\xd0"
+            b"\x08\x06\x00\x00\x00"
+        )
+
+        self.assertEqual(
+            browser_client.BrowserClient._image_dimensions(png_header),
+            (1254, 720),
+        )
 
     def test_reference_image_infos_are_preserved_as_attachments(self):
         attachments = browser_client.BrowserClient._normalize_reference_image_attachments(

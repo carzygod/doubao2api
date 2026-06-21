@@ -687,7 +687,10 @@ def create_app(
                 "height": 64,
             }
 
-        uploaded = await client.upload_image(image_bytes=image_bytes, filename=filename)
+        uploaded = await client.upload_video_reference_image(
+            image_bytes=image_bytes,
+            filename=filename,
+        )
         uri = uploaded.get("uri") or uploaded.get("cdn_url")
         if not uri:
             return None

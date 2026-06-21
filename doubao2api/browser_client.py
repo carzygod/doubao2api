@@ -601,6 +601,8 @@ class BrowserClient:
         use_deep_think: int = 0,
         chat_ability: Optional[Dict[str, Any]] = None,
         image_attachments: Optional[List[Dict[str, Any]]] = None,
+        split_image_attachments: bool = False,
+        attachment_type: int = 2,
         stream_timeout: float = 180,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Send a chat message and yield SSE events via in-browser fetch."""
@@ -615,6 +617,29 @@ class BrowserClient:
         now_ms = int(time.time() * 1000)
         now_sec = int(time.time())
 
+        messages: List[Dict[str, Any]] = []
+        if split_image_attachments and image_attachments:
+            attachment_blocks = self._build_chat_attachment_blocks(
+                image_attachments,
+                attachment_type=attachment_type,
+            )
+            if attachment_blocks:
+                messages.append({
+                    "local_message_id": msg_uuid,
+                    "content_block": attachment_blocks,
+                    "message_status": 0,
+                })
+        text_message_id = str(uuid.uuid4()) if messages else msg_uuid
+        messages.append({
+            "local_message_id": text_message_id,
+            "content_block": self._build_chat_content_blocks(
+                text,
+                image_attachments=None if split_image_attachments else image_attachments,
+                attachment_type=attachment_type,
+            ),
+            "message_status": 0,
+        })
+
         payload = {
             "client_meta": {
                 "local_conversation_id": local_conv_id if need_create else "",
@@ -623,14 +648,7 @@ class BrowserClient:
                 "last_section_id": "",
                 "last_message_index": None,
             },
-            "messages": [{
-                "local_message_id": msg_uuid,
-                "content_block": self._build_chat_content_blocks(
-                    text,
-                    image_attachments=image_attachments,
-                ),
-                "message_status": 0,
-            }],
+            "messages": messages,
             "option": {
                 "send_message_scene": "",
                 "create_time_ms": now_ms,
@@ -748,17 +766,11 @@ class BrowserClient:
         return number if number > 0 else default
 
     @staticmethod
-    def _build_chat_content_blocks(
-        text: str,
+    def _build_chat_attachment_blocks(
         image_attachments: Optional[List[Dict[str, Any]]] = None,
+        attachment_type: int = 2,
     ) -> List[Dict[str, Any]]:
-        """Build Doubao chat content blocks with visible image attachments.
-
-        Doubao's current web UI persists images as BLOCK_ATTACHMENT entries.
-        Passing only Samantha ``attachments`` or only a hidden ``ref_image_key``
-        can make the downstream video skill receive a text-only message.
-        """
-        blocks: List[Dict[str, Any]] = []
+        """Build Doubao chat attachment blocks with visible image metadata."""
         attachments: List[Dict[str, Any]] = []
         for image in image_attachments or []:
             uri = str(
@@ -781,7 +793,7 @@ class BrowserClient:
             width = BrowserClient._safe_int(image.get("width"), 64)
             height = BrowserClient._safe_int(image.get("height"), 64)
             attachments.append({
-                "type": 2,
+                "type": attachment_type,
                 "identifier": str(image.get("identifier") or uuid.uuid4()),
                 "image": {
                     "name": name,
@@ -800,11 +812,13 @@ class BrowserClient:
                 "upload_status": 1,
                 "progress": 100,
                 "src": cdn_url,
-                "extra": {"refer_types": "overall"},
             })
+            if attachment_type != 1:
+                attachments[-1]["extra"] = {"refer_types": "overall"}
 
-        if attachments:
-            blocks.append({
+        if not attachments:
+            return []
+        return [{
                 "block_type": 10052,
                 "content": {
                     "attachment_block": {"attachments": attachments},
@@ -816,9 +830,11 @@ class BrowserClient:
                 "append_fields": [],
                 "is_finish": True,
                 "patch_type": 2,
-            })
+        }]
 
-        blocks.append({
+    @staticmethod
+    def _build_chat_text_blocks(text: str) -> List[Dict[str, Any]]:
+        return [{
             "block_type": 10000,
             "content": {
                 "text_block": {
@@ -835,8 +851,27 @@ class BrowserClient:
             "append_fields": [],
             "is_finish": True,
             "patch_type": 2,
-        })
-        return blocks
+        }]
+
+    @staticmethod
+    def _build_chat_content_blocks(
+        text: str,
+        image_attachments: Optional[List[Dict[str, Any]]] = None,
+        attachment_type: int = 2,
+    ) -> List[Dict[str, Any]]:
+        """Build Doubao chat content blocks with visible image attachments.
+
+        Doubao's current web UI persists images as BLOCK_ATTACHMENT entries.
+        Passing only Samantha ``attachments`` or only a hidden ``ref_image_key``
+        can make the downstream video skill receive a text-only message.
+        """
+        return (
+            BrowserClient._build_chat_attachment_blocks(
+                image_attachments,
+                attachment_type=attachment_type,
+            )
+            + BrowserClient._build_chat_text_blocks(text)
+        )
 
     async def _browser_fetch_stream(
         self, url: str, payload: Dict[str, Any], request_id: str
@@ -857,7 +892,7 @@ class BrowserClient:
                 const csrfToken = csrf ? csrf[1] : '';
                 const headers = {
                     'Content-Type': 'application/json',
-                    'agw-js-conv': 'str',
+                    'agw-js-conv': 'str, str',
                 };
                 if (csrfToken) {
                     headers['x-tt-passport-csrf-token'] = csrfToken;
@@ -1659,7 +1694,6 @@ class BrowserClient:
             reference_image_keys,
             reference_image_infos,
         )
-        image_keys = [str(item["uri"]) for item in image_attachments if item.get("uri")]
 
         ability_param: Dict[str, Any] = {
             "model": model or os.environ.get("DOUBAO_VIDEO_MODEL", "seedance_v2.0"),
@@ -1667,11 +1701,6 @@ class BrowserClient:
         }
         if ratio:
             ability_param["ratio"] = ratio
-        if image_keys:
-            ability_param["ref_image_key"] = image_keys[0]
-            if len(image_keys) > 1:
-                ability_param["ref_image_keys"] = image_keys
-                ability_param["reference_image_keys"] = image_keys
 
         chat_ability = {
             "ability_type": 17,
@@ -1766,6 +1795,8 @@ class BrowserClient:
             use_deep_think=0,
             chat_ability=chat_ability,
             image_attachments=image_attachments,
+            split_image_attachments=bool(image_attachments),
+            attachment_type=1 if image_attachments else 2,
             stream_timeout=float(os.environ.get("DOUBAO_VIDEO_TIMEOUT", "420")),
         ):
             if event.get("error"):
@@ -2129,10 +2160,43 @@ class BrowserClient:
     # File upload (TOS / ImageX flow)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _image_dimensions(image_bytes: bytes) -> tuple[int, int]:
+        """Read common image dimensions without adding heavyweight deps."""
+        if image_bytes.startswith(b"\x89PNG\r\n\x1a\n") and len(image_bytes) >= 24:
+            width = int.from_bytes(image_bytes[16:20], "big")
+            height = int.from_bytes(image_bytes[20:24], "big")
+            if width > 0 and height > 0:
+                return width, height
+        if image_bytes.startswith(b"\xff\xd8"):
+            idx = 2
+            while idx + 9 < len(image_bytes):
+                if image_bytes[idx] != 0xFF:
+                    idx += 1
+                    continue
+                marker = image_bytes[idx + 1]
+                idx += 2
+                if marker in (0xD8, 0xD9):
+                    continue
+                if idx + 2 > len(image_bytes):
+                    break
+                block_len = int.from_bytes(image_bytes[idx:idx + 2], "big")
+                if block_len < 2:
+                    break
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    height = int.from_bytes(image_bytes[idx + 3:idx + 5], "big")
+                    width = int.from_bytes(image_bytes[idx + 5:idx + 7], "big")
+                    if width > 0 and height > 0:
+                        return width, height
+                    break
+                idx += block_len
+        return 64, 64
+
     async def upload_file(
         self,
         file_data: bytes,
         filename: str,
+        resource_type: int = 1,
     ) -> Dict[str, Any]:
         """Upload a file to Doubao's storage (ByteDance TOS via ImageX proxy).
 
@@ -2168,7 +2232,7 @@ class BrowserClient:
         # Step 1: prepare_upload
         resp = await self._http.post(
             signed_url, headers=headers,
-            json={"tenant_id": "5", "scene_id": "5", "resource_type": 1},
+            json={"tenant_id": "5", "scene_id": "5", "resource_type": int(resource_type)},
             timeout=30,
         )
         body = resp.json()
@@ -2271,6 +2335,34 @@ class BrowserClient:
         log.info("File uploaded: %s -> %s", filename, store_uri)
         return {"uri": store_uri, "name": filename, "size": file_size, "file_type": ext}
 
+    async def upload_video_reference_image(
+        self,
+        image_bytes: bytes,
+        filename: str = "image.png",
+    ) -> Dict[str, Any]:
+        """Upload an image through the same ImageX path used by Doubao video UI."""
+        width, height = self._image_dimensions(image_bytes)
+        uploaded = await self.upload_file(
+            image_bytes,
+            filename,
+            resource_type=2,
+        )
+        ext = str(
+            uploaded.get("file_type")
+            or (filename.rsplit(".", 1)[-1] if "." in filename else "png")
+        ).lower()
+        return {
+            "uri": uploaded["uri"],
+            "name": filename,
+            "format": ext,
+            "width": width,
+            "height": height,
+            "cdn_url": "",
+            "parse_state": 0,
+            "review_state": 1,
+            "upload_status": 1,
+            "progress": 100,
+        }
 
     async def get_file_download_url(
         self,
