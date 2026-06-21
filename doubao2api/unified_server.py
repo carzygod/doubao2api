@@ -80,6 +80,21 @@ VIDEO_MODEL_ALIASES: Dict[str, Optional[str]] = {
     "Seedance 2.0": "seedance_v2.0",
     "Seedance 2.0 Fast": "seedance_v2.0",
 }
+VIDEO_MODEL_ALIASES_LOWER = {model.lower() for model in VIDEO_MODEL_ALIASES}
+
+
+def _is_video_model_name(model: Optional[str]) -> bool:
+    normalized = (model or "").strip()
+    if not normalized:
+        return False
+    lowered = normalized.lower()
+    compact = re.sub(r"[\s_-]+", "", lowered)
+    return (
+        normalized in VIDEO_MODEL_ALIASES
+        or lowered in VIDEO_MODEL_ALIASES_LOWER
+        or compact.startswith("seedance")
+        or lowered.startswith("doubao-video")
+    )
 
 # Qianwen models (routed to QianwenClient)
 QIANWEN_MODEL_NAMES = set(QIANWEN_MODELS.keys())
@@ -1697,6 +1712,14 @@ def create_app(
     @app.post("/v1/images/generations")
     async def image_generations(body: ImageGenerationRequest, request: Request):
         _check_auth(request)
+        if _is_video_model_name(body.model):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f'Model "{body.model}" is a video model. '
+                    "Use /v1/video/generations or /v1/videos/generations."
+                ),
+            )
         await bucket.acquire()
         quota_units = _image_quota_units(body)
         account, client = await _get_account_client(
