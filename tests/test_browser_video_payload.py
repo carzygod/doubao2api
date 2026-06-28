@@ -51,6 +51,49 @@ class BrowserVideoPayloadTest(unittest.TestCase):
             "74881234567890",
         )
 
+    def test_samantha_conversation_id_accepts_aliases_and_urls(self):
+        event = {
+            "event_data": json.dumps({
+                "message": json.dumps({
+                    "local_conversation_id": "local-should-not-win",
+                    "meta": {
+                        "conversationUrl": "https://www.doubao.com/chat/74881234567891",
+                    },
+                })
+            })
+        }
+
+        self.assertEqual(
+            browser_client.BrowserClient._find_samantha_conversation_id(event),
+            "74881234567891",
+        )
+        self.assertEqual(
+            browser_client.BrowserClient._find_samantha_conversation_id({
+                "ack": {"conversationId": "74881234567892"},
+            }),
+            "74881234567892",
+        )
+        self.assertEqual(
+            browser_client.BrowserClient._find_samantha_conversation_id({
+                "thread": {"thread_id": "74881234567893"},
+            }),
+            "74881234567893",
+        )
+
+    def test_samantha_task_id_accepts_aliases(self):
+        event = {
+            "event_data": json.dumps({
+                "fin_reason": {
+                    "asyncTaskId": "video-task-alias-123",
+                }
+            })
+        }
+
+        self.assertEqual(
+            browser_client.BrowserClient._find_samantha_task_id(event),
+            "video-task-alias-123",
+        )
+
     def test_video_acceptance_text_detects_current_chinese_copy(self):
         message = "正在为您生成视频，本次使用 Seedance 2.0 Fast 生成，预计等待 1-3分钟。视频生成好后，我会主动发送给你。"
 

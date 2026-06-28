@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -1119,6 +1120,26 @@ class BrowserClient:
             )
 
         body = result.get("body", "")
+        debug_dir = os.environ.get("DOUBAO_SAMANTHA_DEBUG_DIR", "").strip()
+        if debug_dir:
+            try:
+                path = Path(debug_dir)
+                path.mkdir(parents=True, exist_ok=True)
+                name = f"samantha-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.json"
+                (path / name).write_text(
+                    json.dumps(
+                        {
+                            "url": url,
+                            "payload": payload,
+                            "body": body,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            except Exception as exc:
+                log.warning("failed to write Samantha debug dump: %s", exc)
         if body.lstrip().startswith("{"):
             try:
                 err = json.loads(body)
@@ -1248,22 +1269,75 @@ class BrowserClient:
     @staticmethod
     def _find_samantha_conversation_id(value: Any) -> str:
         """Find a conversation_id anywhere in a Samantha SSE event payload."""
+        return BrowserClient._find_samantha_id(
+            value,
+            exact_keys={"conversation_id", "conversationid", "thread_id", "threadid"},
+            fuzzy_terms=("conversation", "thread"),
+            skip_terms=("local",),
+            url_patterns=(r"/chat/(\d{8,})", r"conversation_id[=:\"']+(\d{8,})"),
+        )
+
+    @staticmethod
+    def _find_samantha_task_id(value: Any) -> str:
+        """Find an async task ID anywhere in a Samantha SSE event payload."""
+        return BrowserClient._find_samantha_id(
+            value,
+            exact_keys={"task_id", "taskid", "async_task_id", "asynctaskid", "video_task_id", "videotaskid"},
+            fuzzy_terms=("task",),
+            skip_terms=("local",),
+            url_patterns=(r"(?:task_id|taskId)[=:\"']+([A-Za-z0-9_-]{8,})",),
+        )
+
+    @staticmethod
+    def _find_samantha_id(
+        value: Any,
+        *,
+        exact_keys: set[str],
+        fuzzy_terms: tuple[str, ...],
+        skip_terms: tuple[str, ...] = (),
+        url_patterns: tuple[str, ...] = (),
+    ) -> str:
         if isinstance(value, str):
             try:
                 value = json.loads(value)
             except json.JSONDecodeError:
+                for pattern in url_patterns:
+                    match = re.search(pattern, value)
+                    if match:
+                        return str(match.group(1))
                 return ""
         if isinstance(value, dict):
-            candidate = value.get("conversation_id")
-            if candidate and str(candidate) != "0":
-                return str(candidate)
+            for key, candidate in value.items():
+                key_norm = str(key).replace("-", "_").replace(" ", "_").lower()
+                compact = key_norm.replace("_", "")
+                if any(term in key_norm or term in compact for term in skip_terms):
+                    continue
+                key_matches = compact in exact_keys or key_norm in exact_keys
+                key_matches = key_matches or (
+                    "id" in compact
+                    and any(term in compact for term in fuzzy_terms)
+                )
+                if key_matches and candidate and str(candidate) != "0":
+                    return str(candidate)
             for item in value.values():
-                found = BrowserClient._find_samantha_conversation_id(item)
+                found = BrowserClient._find_samantha_id(
+                    item,
+                    exact_keys=exact_keys,
+                    fuzzy_terms=fuzzy_terms,
+                    skip_terms=skip_terms,
+                    url_patterns=url_patterns,
+                )
                 if found:
                     return found
         elif isinstance(value, list):
             for item in value:
-                found = BrowserClient._find_samantha_conversation_id(item)
+                found = BrowserClient._find_samantha_id(
+                    item,
+                    exact_keys=exact_keys,
+                    fuzzy_terms=fuzzy_terms,
+                    skip_terms=skip_terms,
+                    url_patterns=url_patterns,
+                )
                 if found:
                     return found
         return ""
@@ -2145,6 +2219,11 @@ class BrowserClient:
                         pass
 
         full_text = "".join(text_parts)
+        if not task_id:
+            for data in self._parse_samantha_sse(raw):
+                task_id = self._find_samantha_task_id(data)
+                if task_id:
+                    break
         if "服务过载" in full_text or "重试" in full_text:
             raise RuntimeError("视频生成服务过载，请稍后重试")
 
