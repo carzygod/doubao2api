@@ -1,6 +1,8 @@
 import importlib.util
+import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -80,6 +82,70 @@ class AccountQuotaTest(unittest.TestCase):
                 self.assertEqual(snapshot["effective_remaining"], 6)
                 self.assertTrue(store.has_quota(account, "video", 6))
                 self.assertFalse(store.has_quota(account, "video", 7))
+            finally:
+                if old_video is None:
+                    os.environ.pop("DOUBAO_VIDEO_24H_QUOTA", None)
+                else:
+                    os.environ["DOUBAO_VIDEO_24H_QUOTA"] = old_video
+
+    def test_provider_zero_quota_uses_reset_at_instead_of_fake_usage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_video = os.environ.get("DOUBAO_VIDEO_24H_QUOTA")
+            os.environ["DOUBAO_VIDEO_24H_QUOTA"] = "10"
+            try:
+                store = DoubaoAccountStore(str(Path(tmp) / "accounts.sqlite3"))
+                store.ensure_default_account()
+
+                account = store.update_provider_quota(
+                    "default",
+                    "video",
+                    remaining=0,
+                    source="quota_error",
+                    message="今日视频生成免费次数已用完",
+                )
+                snapshot = store.quota_snapshot(account, "video")
+
+                self.assertEqual(snapshot["provider"]["remaining"], 0)
+                self.assertGreater(snapshot["provider"]["reset_at"], int(time.time()))
+                self.assertFalse(store.has_quota(account, "video", 1))
+
+                store.mark_quota_exhausted("default", "video", "今日视频生成免费次数已用完")
+                self.assertEqual(store.quota_used("default", "video"), 0)
+            finally:
+                if old_video is None:
+                    os.environ.pop("DOUBAO_VIDEO_24H_QUOTA", None)
+                else:
+                    os.environ["DOUBAO_VIDEO_24H_QUOTA"] = old_video
+
+    def test_expired_provider_zero_quota_becomes_stale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_video = os.environ.get("DOUBAO_VIDEO_24H_QUOTA")
+            os.environ["DOUBAO_VIDEO_24H_QUOTA"] = "10"
+            try:
+                store = DoubaoAccountStore(str(Path(tmp) / "accounts.sqlite3"))
+                store.ensure_default_account()
+                now = int(time.time())
+                account = store.update_account(
+                    "default",
+                    quota_json=json.dumps(
+                        {
+                            "provider_quota": {
+                                "video": {
+                                    "remaining": 0,
+                                    "synced_at": now,
+                                    "reset_at": now - 1,
+                                    "source": "quota_error",
+                                }
+                            }
+                        }
+                    ),
+                )
+
+                snapshot = store.quota_snapshot(account, "video")
+
+                self.assertTrue(snapshot["provider"]["stale"])
+                self.assertEqual(snapshot["effective_remaining"], 10)
+                self.assertTrue(store.has_quota(account, "video", 1))
             finally:
                 if old_video is None:
                     os.environ.pop("DOUBAO_VIDEO_24H_QUOTA", None)

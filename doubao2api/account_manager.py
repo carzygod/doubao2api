@@ -10,8 +10,13 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, TYPE_CHECKING
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover - Python always has zoneinfo in supported runtimes.
+    ZoneInfo = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
     from .browser_client import BrowserClient
@@ -84,6 +89,37 @@ def _safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _quota_timezone():
+    name = (
+        os.environ.get("DOUBAO_PROVIDER_QUOTA_TIMEZONE")
+        or os.environ.get("DOUBAO_QUOTA_TIMEZONE")
+        or "Asia/Shanghai"
+    )
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(name)
+        except Exception:
+            pass
+    return timezone.utc
+
+
+def _next_provider_quota_reset_at(now: Optional[int] = None) -> int:
+    now_ts = int(now if now is not None else _now())
+    reset_hour = max(0, min(23, _env_int("DOUBAO_PROVIDER_QUOTA_RESET_HOUR", 0)))
+    reset_minute = max(0, min(59, _env_int("DOUBAO_PROVIDER_QUOTA_RESET_MINUTE", 0)))
+    tz = _quota_timezone()
+    current = datetime.fromtimestamp(now_ts, tz=tz)
+    reset = current.replace(
+        hour=reset_hour,
+        minute=reset_minute,
+        second=0,
+        microsecond=0,
+    )
+    if reset <= current:
+        reset += timedelta(days=1)
+    return int(reset.timestamp())
 
 
 def _safe_id(value: str) -> str:
@@ -412,14 +448,20 @@ class DoubaoAccountStore:
         remaining = _safe_int(raw.get("remaining"))
         limit = _safe_int(raw.get("limit"))
         synced_at = _safe_int(raw.get("synced_at"))
+        reset_at = _safe_int(raw.get("reset_at"))
         source = str(raw.get("source") or "")
         ttl = _env_int("DOUBAO_PROVIDER_QUOTA_TTL_SECONDS", 24 * 3600)
-        stale = bool(ttl > 0 and synced_at and _now() - synced_at > ttl)
+        now = _now()
+        stale = bool(
+            (reset_at and now >= reset_at)
+            or (ttl > 0 and synced_at and now - synced_at > ttl)
+        )
         return {
             "kind": kind,
             "remaining": remaining,
             "limit": limit,
             "synced_at": synced_at,
+            "reset_at": reset_at,
             "source": source,
             "stale": stale,
             "message": str(raw.get("message") or "")[:500],
@@ -556,6 +598,8 @@ class DoubaoAccountStore:
         account = self.get(account_id)
         if not account or kind not in QUOTA_KINDS:
             return
+        if os.environ.get("DOUBAO_MARK_QUOTA_EXHAUSTED_AS_USAGE", "false").lower() not in {"1", "true", "yes", "on"}:
+            return
         snapshot = self.quota_snapshot(account, kind)
         remaining = snapshot.get("remaining")
         if remaining is None:
@@ -628,14 +672,20 @@ class DoubaoAccountStore:
         if not isinstance(current, dict):
             current = {}
         current_limit = _safe_int(current.get("limit"))
-        provider_quota[kind] = {
+        remaining_value = max(0, int(remaining))
+        entry = {
             **current,
-            "remaining": max(0, int(remaining)),
+            "remaining": remaining_value,
             "limit": _safe_int(limit, current_limit),
             "source": source,
             "synced_at": _now(),
             "message": message[:500],
         }
+        if remaining_value <= 0:
+            entry["reset_at"] = _next_provider_quota_reset_at()
+        else:
+            entry.pop("reset_at", None)
+        provider_quota[kind] = entry
         quota["provider_quota"] = provider_quota
         return self.update_account(account_id, quota_json=json.dumps(quota, ensure_ascii=False))
 
@@ -650,6 +700,10 @@ class DoubaoAccountStore:
         if not text:
             return self.get(account_id)
         patterns = [
+            r"(?:今日|今天)?\s*(?:剩余|还剩)\s*(\d+)\s*个?(?:视频生成额度|视频额度|生成额度|额度)",
+            r"(?:视频生成额度|视频额度|生成额度|额度)\s*(?:剩余|还剩)\s*(\d+)\s*个?",
+            r"(?:今日|今天)?\s*(?:剩余|还剩)\s*(\d+)\s*个?(?:视频生成|视频|生成)",
+            r"(?:视频生成|视频|生成)\s*(?:剩余|还剩)\s*(\d+)\s*个?",
             r"(?:今日|今天)?\s*(?:剩余|还剩)\s*(\d+)\s*个?(?:视频生成额度|视频额度|生成额度|额度)",
             r"(?:视频生成额度|视频额度|生成额度|额度)\s*(?:剩余|还剩)\s*(\d+)\s*个?",
             r"(?:今日|今天)?\s*(?:剩余|还剩)\s*(\d+)\s*个?(?:视频生成额度|视频额度|生成额度)",
