@@ -489,6 +489,30 @@ def create_app(
                 local_conversation_id = local_conversation_id or str(result.get("local_conversation_id") or "")
         return provider_task_id, conversation_id, local_conversation_id
 
+    def _video_task_provider_task_candidates(task: Dict[str, Any]) -> list[str]:
+        candidates: list[str] = []
+
+        def add(value: Any) -> None:
+            text = str(value or "").strip()
+            if text and text != "0" and text not in candidates:
+                candidates.append(text)
+
+        add(task.get("provider_task_id"))
+        if task.get("result_json"):
+            try:
+                result = json.loads(str(task["result_json"]))
+            except json.JSONDecodeError:
+                result = {}
+            if isinstance(result, dict):
+                add(result.get("provider_task_id"))
+                raw_candidates = result.get("provider_task_candidates") or []
+                if isinstance(raw_candidates, list):
+                    for value in raw_candidates:
+                        add(value)
+                for key in ("user_message_id", "reply_id", "bot_message_id"):
+                    add(result.get(key))
+        return candidates
+
     # ── Auth helper ──
 
     def _effective_api_key() -> str:
@@ -1309,12 +1333,28 @@ def create_app(
             recover_timeout = float(timeout if timeout is not None else os.environ.get("DOUBAO_VIDEO_RECOVERY_POLL_SECONDS", "20"))
             try:
                 async with _video_account_lock(account["id"]):
-                    if provider_task_id:
-                        result = await client.poll_video_result(
-                            provider_task_id,
-                            str(task.get("prompt") or ""),
-                            timeout=recover_timeout,
-                        )
+                    provider_task_candidates = _video_task_provider_task_candidates(task)
+                    if provider_task_candidates:
+                        result = {"videos": [], "prompt": str(task.get("prompt") or "")}
+                        for candidate in provider_task_candidates:
+                            try:
+                                result = await client.poll_video_result(
+                                    candidate,
+                                    str(task.get("prompt") or ""),
+                                    timeout=recover_timeout,
+                                )
+                            except Exception as exc:
+                                log.warning(
+                                    "video recovery task %s candidate %s failed: %s",
+                                    task_id,
+                                    candidate,
+                                    exc,
+                                )
+                                continue
+                            result_msg = str(result.get("message") or "")
+                            if result.get("videos") or _looks_quota_error(result_msg):
+                                result.setdefault("provider_task_id", candidate)
+                                break
                     else:
                         result = await client.recover_video_result(
                             str(task.get("prompt") or ""),

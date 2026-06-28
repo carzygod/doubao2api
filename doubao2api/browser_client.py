@@ -1152,6 +1152,90 @@ class BrowserClient:
                 pass
         return body
 
+    async def _samantha_async_stream_request(
+        self,
+        payload: Dict[str, Any],
+        timeout: float = 120,
+    ) -> str:
+        """Send a request to /samantha/chat/async/stream via in-browser fetch."""
+        if not self._ready:
+            raise RuntimeError("Browser not ready - need login first")
+
+        query_params = self._build_query_params()
+        query_params.pop("fp", None)
+        query_string = "&".join(f"{k}={v}" for k, v in sorted(query_params.items()))
+        url = f"/samantha/chat/async/stream?{query_string}"
+
+        js_code = """
+        async ([url, payloadJson, timeoutMs]) => {
+            const csrf = document.cookie.match(/passport_csrf_token=([^;]+)/);
+            const csrfToken = csrf ? csrf[1] : '';
+            const headers = {
+                'Accept': 'text/event-stream',
+                'Content-Type': 'application/json',
+                'Agw-Js-Conv': 'str',
+            };
+            if (csrfToken) {
+                headers['x-tt-passport-csrf-token'] = csrfToken;
+            }
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: headers,
+                    body: payloadJson,
+                    credentials: 'include',
+                    signal: controller.signal,
+                });
+                clearTimeout(timer);
+                const body = await res.text();
+                if (!res.ok) {
+                    return {error: true, status: res.status, body: body.slice(0, 500)};
+                }
+                return {error: false, body: body};
+            } catch(e) {
+                clearTimeout(timer);
+                return {error: true, status: 0, body: e.message};
+            }
+        }
+        """
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        timeout_ms = int(timeout * 1000)
+
+        log.info("POST %s [browser fetch, timeout=%ds]", url.split("?")[0], timeout)
+        result = await self._page.evaluate(js_code, [url, payload_json, timeout_ms])
+
+        if result.get("error"):
+            status = result.get("status", 0)
+            body = result.get("body", "")
+            raise RuntimeError(
+                f"samantha/chat/async/stream failed ({status}): {body[:500]}"
+            )
+
+        body = result.get("body", "")
+        debug_dir = os.environ.get("DOUBAO_SAMANTHA_DEBUG_DIR", "").strip()
+        if debug_dir:
+            try:
+                path = Path(debug_dir)
+                path.mkdir(parents=True, exist_ok=True)
+                name = f"samantha-async-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.json"
+                (path / name).write_text(
+                    json.dumps(
+                        {
+                            "url": url,
+                            "payload": payload,
+                            "body": body,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            except Exception as exc:
+                log.warning("failed to write Samantha async debug dump: %s", exc)
+        return body
+
     async def _browser_post_json(
         self,
         path: str,
@@ -2178,6 +2262,9 @@ class BrowserClient:
         # Phase 1: Extract async task_id from fin_reason
         task_id = None
         conversation_id = ""
+        user_message_id = ""
+        bot_message_id = ""
+        reply_id = ""
         text_parts = []
         for data in self._parse_samantha_sse(raw):
             if not conversation_id:
@@ -2186,8 +2273,6 @@ class BrowserClient:
             if et == 2005:
                 detail = data.get("event_data", "")
                 raise RuntimeError(f"generate_video error: {str(detail)[:500]}")
-            if et != 2001:
-                continue
 
             ed = data.get("event_data", {})
             if isinstance(ed, str):
@@ -2195,6 +2280,15 @@ class BrowserClient:
                     ed = json.loads(ed)
                 except json.JSONDecodeError:
                     continue
+
+            event_message_id = str(ed.get("message_id") or "")
+            event_reply_id = str(ed.get("reply_id") or "")
+            if et == 2002 and event_message_id and not user_message_id:
+                user_message_id = event_message_id
+            if event_reply_id and not reply_id:
+                reply_id = event_reply_id
+            if et != 2001:
+                continue
 
             # Check for async task
             fin_reason = ed.get("fin_reason", {})
@@ -2210,6 +2304,8 @@ class BrowserClient:
                 except json.JSONDecodeError:
                     continue
             if msg.get("content_type") == 2001:
+                if event_message_id and not bot_message_id:
+                    bot_message_id = event_message_id
                 content_raw = msg.get("content", "")
                 if isinstance(content_raw, str):
                     try:
@@ -2224,6 +2320,12 @@ class BrowserClient:
                 task_id = self._find_samantha_task_id(data)
                 if task_id:
                     break
+        provider_task_candidates: List[str] = []
+        for candidate in (task_id, user_message_id, reply_id, bot_message_id):
+            if candidate and candidate not in provider_task_candidates and str(candidate) != "0":
+                provider_task_candidates.append(str(candidate))
+        if not task_id and provider_task_candidates:
+            task_id = provider_task_candidates[0]
         if "服务过载" in full_text or "重试" in full_text:
             raise RuntimeError("视频生成服务过载，请稍后重试")
 
@@ -2248,9 +2350,13 @@ class BrowserClient:
                 "prompt": prompt,
                 "message": full_text,
                 "provider_task_id": task_id,
+                "provider_task_candidates": provider_task_candidates,
                 "conversation_id": conversation_id,
                 "local_conversation_id": local_conversation_id,
                 "local_message_id": local_message_id,
+                "user_message_id": user_message_id,
+                "bot_message_id": bot_message_id,
+                "reply_id": reply_id,
             }
 
         result = {
@@ -2258,9 +2364,13 @@ class BrowserClient:
             "prompt": prompt,
             "message": full_text,
             "provider_task_id": task_id,
+            "provider_task_candidates": provider_task_candidates,
             "conversation_id": conversation_id,
             "local_conversation_id": local_conversation_id,
             "local_message_id": local_message_id,
+            "user_message_id": user_message_id,
+            "bot_message_id": bot_message_id,
+            "reply_id": reply_id,
             "pending": True,
             "accepted": True,
         }
@@ -2308,12 +2418,11 @@ class BrowserClient:
     async def _poll_video_result(
         self, task_id: str, prompt: str, timeout: float = 300
     ) -> Dict[str, Any]:
-        """Poll /samantha/chat/completion with task_id for video result."""
+        """Poll /samantha/chat/async/stream with task_id for video result."""
         import base64
 
         poll_payload = {"task_id": task_id, "event_id": 0}
-        # Use _samantha_request which now uses browser fetch
-        raw = await self._samantha_request(poll_payload, timeout=timeout)
+        raw = await self._samantha_async_stream_request(poll_payload, timeout=timeout)
 
         videos = []
         text_parts: List[str] = []
