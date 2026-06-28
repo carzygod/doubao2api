@@ -234,6 +234,20 @@ class VideoTaskStore:
             ).fetchall()
             now = int(time.time())
             for row in rows:
+                failure_message = row["error"] or row["message"] or ""
+                if self._is_completed_failure_message(failure_message):
+                    conn.execute(
+                        """
+                        UPDATE video_tasks
+                           SET status = 'failed',
+                               updated = ?,
+                               error = ?,
+                               message = COALESCE(message, ?)
+                         WHERE task_id = ?
+                        """,
+                        (now, failure_message, failure_message, row["task_id"]),
+                    )
+                    continue
                 if self._completed_result_has_video_url(row["result_json"]):
                     conn.execute(
                         """
@@ -284,6 +298,25 @@ class VideoTaskStore:
                     if isinstance(item, dict) and (item.get("video_url") or item.get("url")):
                         return True
         return bool(result_json.get("url") or result_json.get("video_url"))
+
+    @staticmethod
+    def _is_completed_failure_message(message: Any) -> bool:
+        text = str(message or "").lower()
+        if not text:
+            return False
+        if VideoTaskStore._is_terminal_failure_message(text):
+            return True
+        return any(
+            marker in text
+            for marker in (
+                "did not expose",
+                "not recoverable",
+                "no videos generated",
+                "without video url",
+                "without a retrievable video url",
+                "completed video task did not contain",
+            )
+        )
 
     def cleanup(self, max_age_seconds: int = 7 * 24 * 3600) -> None:
         cutoff = int(time.time()) - max_age_seconds
