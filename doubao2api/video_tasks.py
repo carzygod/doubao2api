@@ -108,6 +108,36 @@ class VideoTaskStore:
                     conn.execute(sql)
 
     @staticmethod
+    def _is_terminal_failure_message(message: Any = "") -> bool:
+        text = str(message or "").lower()
+        if "视频生成" in text and any(marker in text for marker in (
+            "今日视频生成免费次数已用完",
+            "视频生成免费次数已用完",
+            "免费次数已用完",
+            "次数已用完",
+            "即可继续使用视频生成",
+            "继续使用视频生成",
+            "开通豆包专业版",
+            "开通加强套餐",
+            "开通套餐",
+        )):
+            return True
+        return any(marker in text for marker in (
+            "积分不足",
+            "余额不足",
+            "权益不足",
+            "没有相关权益",
+            "没有视频生成权益",
+            "额度不足",
+            "额度已用完",
+            "视频生成额度已用完",
+            "quota exceeded",
+            "quota exhausted",
+            "quota insufficient",
+            "quota limit",
+        ))
+
+    @staticmethod
     def _is_accepted_pending_result(result_json: Any, message: Any = "") -> bool:
         if isinstance(result_json, str) and result_json.strip():
             try:
@@ -115,14 +145,18 @@ class VideoTaskStore:
             except json.JSONDecodeError:
                 result_json = {}
         if isinstance(result_json, dict):
+            message = message or result_json.get("message", "")
+            if VideoTaskStore._is_terminal_failure_message(message):
+                return False
             if result_json.get("pending") and (
                 result_json.get("accepted")
                 or result_json.get("conversation_id")
                 or result_json.get("provider_task_id")
             ):
                 return True
-            message = message or result_json.get("message", "")
         text = str(message or "").lower()
+        if VideoTaskStore._is_terminal_failure_message(text):
+            return False
         return any(
             marker in text
             for marker in (

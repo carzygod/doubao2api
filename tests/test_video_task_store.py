@@ -163,6 +163,34 @@ class VideoTaskStoreTest(unittest.TestCase):
 
             self.assertEqual([task["task_id"] for task in candidates], ["video-pending"])
 
+    def test_quota_exhausted_pending_task_is_not_recoverable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "video_tasks.sqlite3"
+            store = VideoTaskStore(str(db_path))
+            store.create(
+                "video-quota-exhausted",
+                {"prompt": "red square", "model": "doubao-video"},
+                {"prompt": "red square"},
+            )
+            message = "正在为您生成视频...\n\n今日视频生成免费次数已用完。开通豆包专业版加强套餐，即可继续使用视频生成。"
+            store.update(
+                "video-quota-exhausted",
+                "in_progress",
+                result_json=json.dumps({"pending": True, "accepted": True, "message": message}),
+                message=message,
+                accepted_at=123,
+            )
+
+            candidates = store.recovery_candidates(min_interval_seconds=0)
+
+            self.assertEqual(candidates, [])
+            self.assertFalse(
+                VideoTaskStore._is_accepted_pending_result(
+                    json.dumps({"pending": True, "accepted": True, "message": message}),
+                    message,
+                )
+            )
+
     def test_normalize_completed_clears_stale_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "video_tasks.sqlite3"

@@ -1231,6 +1231,8 @@ def create_app(
             raise HTTPException(status_code=404, detail="Video task not found")
         if task.get("status") in {"completed", "cancelled"}:
             return task
+        if _looks_quota_error(str(task.get("message") or task.get("error") or "")):
+            return task
         if not VideoTaskStore._is_accepted_pending_result(
             task.get("result_json"),
             task.get("message"),
@@ -1240,6 +1242,8 @@ def create_app(
         async with _video_lock(task_id):
             task = video_tasks.get(task_id) or task
             if task.get("status") in {"completed", "cancelled"}:
+                return task
+            if _looks_quota_error(str(task.get("message") or task.get("error") or "")):
                 return task
             if not VideoTaskStore._is_accepted_pending_result(
                 task.get("result_json"),
