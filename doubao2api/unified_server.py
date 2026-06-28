@@ -953,6 +953,15 @@ def create_app(
                 for key in ("provider_task_id", "conversation_id", "local_conversation_id"):
                     if result.get(key):
                         response[key] = result.get(key)
+                for key in (
+                    "provider_task_candidates",
+                    "local_message_id",
+                    "user_message_id",
+                    "bot_message_id",
+                    "reply_id",
+                ):
+                    if result.get(key):
+                        response[key] = result.get(key)
                 if params.get("reference_image_keys"):
                     response["reference_image_keys"] = params["reference_image_keys"]
                 if msg:
@@ -995,6 +1004,15 @@ def create_app(
             "quota": accounts.store.quota_snapshot(refreshed_account, "video"),
         }
         for key in ("provider_task_id", "conversation_id", "local_conversation_id"):
+            if result.get(key):
+                response[key] = result.get(key)
+        for key in (
+            "provider_task_candidates",
+            "local_message_id",
+            "user_message_id",
+            "bot_message_id",
+            "reply_id",
+        ):
             if result.get(key):
                 response[key] = result.get(key)
         if params.get("reference_image_keys"):
@@ -1144,6 +1162,15 @@ def create_app(
                     response["pending"] = True
                     response["accepted"] = bool(result.get("accepted", True))
                 for key in ("provider_task_id", "conversation_id", "local_conversation_id"):
+                    if result.get(key):
+                        response[key] = result.get(key)
+                for key in (
+                    "provider_task_candidates",
+                    "local_message_id",
+                    "user_message_id",
+                    "bot_message_id",
+                    "reply_id",
+                ):
                     if result.get(key):
                         response[key] = result.get(key)
                 if result.get("account_id"):
