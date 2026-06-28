@@ -1051,7 +1051,8 @@ class BrowserClient:
         meta = event.get("meta", {})
         if meta.get("conversation_id"):
             return meta["conversation_id"]
-        return None
+        found = BrowserClient._find_samantha_conversation_id(event)
+        return found or None
 
     # ------------------------------------------------------------------
     # Samantha endpoint (image/video/music generation)
@@ -1842,6 +1843,8 @@ class BrowserClient:
         reference_image_infos: Optional[List[Dict[str, Any]]] = None,
         model: Optional[str] = None,
         duration: Optional[int] = None,
+        wait_for_result: bool = True,
+        ui_timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Generate video through Doubao's current web chat ability path."""
         import base64
@@ -1864,7 +1867,8 @@ class BrowserClient:
             "ability_type": 17,
             "ability_param": json.dumps(ability_param, ensure_ascii=False),
         }
-        text_prompt = prompt if prompt.strip().startswith("生成视频") else f"生成视频：{prompt}"
+        video_prefix = "\u751f\u6210\u89c6\u9891"
+        text_prompt = prompt if prompt.strip().startswith(video_prefix) else f"{video_prefix}\uff1a{prompt}"
 
         videos: List[Dict[str, Any]] = []
         text_parts: List[str] = []
@@ -1973,18 +1977,24 @@ class BrowserClient:
         full_text = fix_mojibake("".join(text_parts).strip())
         log.info("generate_video_web: got %d videos; text=%s", len(videos), full_text[:120])
         if not videos and self._is_video_acceptance_text(full_text):
-            ui_result = await self._wait_for_video_result_from_ui(
-                prompt,
-                conversation_id=conversation_id or None,
-            )
-            videos.extend(ui_result.get("videos", []))
-            conversation_id = conversation_id or str(ui_result.get("conversation_id") or "")
-        return {
+            if wait_for_result:
+                ui_result = await self._wait_for_video_result_from_ui(
+                    prompt,
+                    conversation_id=conversation_id or None,
+                    timeout=float(ui_timeout if ui_timeout is not None else os.environ.get("DOUBAO_VIDEO_UI_WAIT_SECONDS", "360")),
+                )
+                videos.extend(ui_result.get("videos", []))
+                conversation_id = conversation_id or str(ui_result.get("conversation_id") or "")
+        result = {
             "videos": videos,
             "prompt": prompt,
             "message": full_text,
             "conversation_id": conversation_id,
         }
+        if not videos and self._is_video_acceptance_text(full_text):
+            result["pending"] = True
+            result["accepted"] = True
+        return result
 
     @staticmethod
     def _is_video_terminal_failure_text(text: str) -> bool:
@@ -2002,6 +2012,14 @@ class BrowserClient:
         )):
             return True
         return any(marker in lowered for marker in (
+            "\u79ef\u5206\u4e0d\u8db3",
+            "\u4f59\u989d\u4e0d\u8db3",
+            "\u6743\u76ca\u4e0d\u8db3",
+            "\u6ca1\u6709\u76f8\u5173\u6743\u76ca",
+            "\u6ca1\u6709\u89c6\u9891\u751f\u6210\u6743\u76ca",
+            "\u989d\u5ea6\u4e0d\u8db3",
+            "\u989d\u5ea6\u5df2\u7528\u5b8c",
+            "\u89c6\u9891\u751f\u6210\u989d\u5ea6\u5df2\u7528\u5b8c",
             "积分不足",
             "余额不足",
             "权益不足",
@@ -2022,6 +2040,11 @@ class BrowserClient:
             return False
         lowered = (text or "").lower()
         return any(marker in lowered for marker in (
+            "\u6b63\u5728\u4e3a\u60a8\u751f\u6210\u89c6\u9891",
+            "\u89c6\u9891\u751f\u6210\u597d\u540e",
+            "\u751f\u6210\u597d\u540e",
+            "\u9884\u8ba1\u7b49\u5f85",
+            "\u6b63\u5728\u751f\u6210",
             "正在为您生成视频",
             "视频生成好后",
             "生成好后",
@@ -2328,11 +2351,13 @@ class BrowserClient:
                 if task_id:
                     break
         provider_task_candidates: List[str] = []
-        for candidate in (task_id, user_message_id, reply_id, bot_message_id):
+        for candidate in (task_id,):
             if candidate and candidate not in provider_task_candidates and str(candidate) != "0":
                 provider_task_candidates.append(str(candidate))
-        if not task_id and provider_task_candidates:
-            task_id = provider_task_candidates[0]
+        message_id_candidates: List[str] = []
+        for candidate in (user_message_id, reply_id, bot_message_id):
+            if candidate and candidate not in message_id_candidates and str(candidate) != "0":
+                message_id_candidates.append(str(candidate))
         if "服务过载" in full_text or "重试" in full_text:
             raise RuntimeError("视频生成服务过载，请稍后重试")
 
@@ -2364,6 +2389,7 @@ class BrowserClient:
                 "user_message_id": user_message_id,
                 "bot_message_id": bot_message_id,
                 "reply_id": reply_id,
+                "message_id_candidates": message_id_candidates,
             }
 
         result = {
@@ -2378,6 +2404,7 @@ class BrowserClient:
             "user_message_id": user_message_id,
             "bot_message_id": bot_message_id,
             "reply_id": reply_id,
+            "message_id_candidates": message_id_candidates,
             "pending": True,
             "accepted": True,
         }

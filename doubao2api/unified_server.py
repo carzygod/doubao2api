@@ -289,6 +289,25 @@ def is_quota_exhaustion_message(message: str) -> bool:
         "exceeded",
         "insufficient",
         "not enough",
+        "\u6b21\u6570",
+        "\u7528\u5b8c",
+        "\u4e0d\u8db3",
+        "\u4e0a\u9650",
+        "\u4eca\u65e5\u5269\u4f59 0",
+        "\u5269\u4f590",
+        "\u8fd8\u5269 0",
+        "\u8fd8\u52690",
+        "\u989d\u5ea6\u4e0d\u8db3",
+        "\u989d\u5ea6\u5df2\u7528\u5b8c",
+        "\u89c6\u9891\u751f\u6210\u989d\u5ea6\u5df2\u7528\u5b8c",
+        "\u79ef\u5206\u4e0d\u8db3",
+        "\u4f59\u989d\u4e0d\u8db3",
+        "\u6743\u76ca\u4e0d\u8db3",
+        "\u6ca1\u6709\u76f8\u5173\u6743\u76ca",
+        "\u6ca1\u6709\u89c6\u9891\u751f\u6210\u6743\u76ca",
+        "\u6b21\u6570\u4e0d\u8db3",
+        "\u6b21\u6570\u5df2\u7528\u5b8c",
+        "\u514d\u8d39\u6b21\u6570\u5df2\u7528\u5b8c",
         "次数",
         "用完",
         "不足",
@@ -325,6 +344,11 @@ def is_video_acceptance_message(message: str) -> bool:
         return False
     text = message or ""
     markers = (
+        "\u6b63\u5728\u4e3a\u60a8\u751f\u6210\u89c6\u9891",
+        "\u89c6\u9891\u751f\u6210\u597d\u540e",
+        "\u751f\u6210\u597d\u540e",
+        "\u9884\u8ba1\u7b49\u5f85",
+        "\u6b63\u5728\u751f\u6210",
         "正在为您生成视频",
         "预计等待",
         "生成好后",
@@ -509,8 +533,6 @@ def create_app(
                 if isinstance(raw_candidates, list):
                     for value in raw_candidates:
                         add(value)
-                for key in ("user_message_id", "reply_id", "bot_message_id"):
-                    add(result.get(key))
         return candidates
 
     # ── Auth helper ──
@@ -907,7 +929,7 @@ def create_app(
                         ref_image_key=ref_image_key,
                         reference_image_keys=json.dumps(reference_image_keys, ensure_ascii=False),
                     )
-                result = await client.submit_video(
+                result = await client.generate_video_web(
                     prompt=params["prompt"],
                     ratio=params.get("ratio"),
                     ref_image_key=ref_image_key,
@@ -915,7 +937,19 @@ def create_app(
                     reference_image_infos=reference_image_infos,
                     model=params.get("provider_model"),
                     duration=params.get("duration"),
+                    wait_for_result=False,
                 )
+                if not result.get("videos") and not _accepted_video_result(result):
+                    log.info("video web ability did not return a bindable pending task; trying Samantha fallback")
+                    result = await client.submit_video(
+                        prompt=params["prompt"],
+                        ratio=params.get("ratio"),
+                        ref_image_key=ref_image_key,
+                        reference_image_keys=reference_image_keys,
+                        reference_image_infos=reference_image_infos,
+                        model=params.get("provider_model"),
+                        duration=params.get("duration"),
+                    )
         except HTTPException:
             accounts.release_quota(reservation_id)
             raise
@@ -955,6 +989,7 @@ def create_app(
                         response[key] = result.get(key)
                 for key in (
                     "provider_task_candidates",
+                    "message_id_candidates",
                     "local_message_id",
                     "user_message_id",
                     "bot_message_id",
@@ -1008,6 +1043,7 @@ def create_app(
                 response[key] = result.get(key)
         for key in (
             "provider_task_candidates",
+            "message_id_candidates",
             "local_message_id",
             "user_message_id",
             "bot_message_id",
@@ -1166,6 +1202,7 @@ def create_app(
                         response[key] = result.get(key)
                 for key in (
                     "provider_task_candidates",
+                    "message_id_candidates",
                     "local_message_id",
                     "user_message_id",
                     "bot_message_id",
@@ -1361,7 +1398,13 @@ def create_app(
             try:
                 async with _video_account_lock(account["id"]):
                     provider_task_candidates = _video_task_provider_task_candidates(task)
-                    if provider_task_candidates:
+                    if conversation_id:
+                        result = await client.recover_video_result(
+                            str(task.get("prompt") or ""),
+                            conversation_id=conversation_id,
+                            timeout=recover_timeout,
+                        )
+                    elif provider_task_candidates:
                         result = {"videos": [], "prompt": str(task.get("prompt") or "")}
                         for candidate in provider_task_candidates:
                             try:
@@ -1383,11 +1426,7 @@ def create_app(
                                 result.setdefault("provider_task_id", candidate)
                                 break
                     else:
-                        result = await client.recover_video_result(
-                            str(task.get("prompt") or ""),
-                            conversation_id=conversation_id or None,
-                            timeout=recover_timeout,
-                        )
+                        result = {"videos": [], "prompt": str(task.get("prompt") or "")}
             except Exception as exc:
                 log.warning("video recovery failed for %s: %s", task_id, exc)
                 return video_tasks.get(task_id) or task

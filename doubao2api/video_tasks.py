@@ -123,6 +123,14 @@ class VideoTaskStore:
         )):
             return True
         return any(marker in text for marker in (
+            "\u79ef\u5206\u4e0d\u8db3",
+            "\u4f59\u989d\u4e0d\u8db3",
+            "\u6743\u76ca\u4e0d\u8db3",
+            "\u6ca1\u6709\u76f8\u5173\u6743\u76ca",
+            "\u6ca1\u6709\u89c6\u9891\u751f\u6210\u6743\u76ca",
+            "\u989d\u5ea6\u4e0d\u8db3",
+            "\u989d\u5ea6\u5df2\u7528\u5b8c",
+            "\u89c6\u9891\u751f\u6210\u989d\u5ea6\u5df2\u7528\u5b8c",
             "积分不足",
             "余额不足",
             "权益不足",
@@ -174,6 +182,11 @@ class VideoTaskStore:
                 "will notify",
                 "accepted the video request",
                 "video is being generated",
+                "\u751f\u6210\u597d\u540e",
+                "\u6b63\u5728\u4e3a\u60a8\u751f\u6210",
+                "\u6b63\u5728\u751f\u6210",
+                "\u9884\u8ba1\u7b49\u5f85",
+                "\u89c6\u9891\u751f\u6210",
                 "生成好后",
                 "正在为您生成",
                 "正在生成",
